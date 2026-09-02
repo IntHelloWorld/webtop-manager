@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimum permissions for the local management window","local":true,"windows":["main"],"permissions":["core:default","core:event:allow-listen","core:event:allow-unlisten"]}}

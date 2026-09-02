@@ -1,0 +1,6 @@
+.git
+.pnpm-store
+dist
+node_modules
+target
+src-tauri/assets/controller-image.tar.zst

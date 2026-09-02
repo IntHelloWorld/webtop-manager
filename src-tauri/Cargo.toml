@@ -1,0 +1,42 @@
+[package]
+name = "webtop-manager"
+version.workspace = true
+description = "A local desktop manager for LinuxServer Webtop environments"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "webtop_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "webtop-manager"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow.workspace = true
+bollard.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+hyperlocal.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+thiserror.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+webtop-contracts.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,44 @@
+name: Bug report
+description: Report a reproducible non-security defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include passwords, tokens, `.wtmpl` files, private host paths, databases, or unredacted logs. Security vulnerabilities belong in a private Security Advisory.
+  - type: input
+    id: version
+    attributes:
+      label: Webtop Manager version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Linux distribution and Docker version
+      placeholder: Ubuntu 24.04; Docker 27.x
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the actual and expected behavior without sensitive data.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      placeholder: "1. Create ...\n2. Select ...\n3. Observe ..."
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Sensitive-data check
+      options:
+        - label: I removed credentials, private paths, templates, databases, and unredacted logs.
+          required: true

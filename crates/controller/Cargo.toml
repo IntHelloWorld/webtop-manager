@@ -1,0 +1,36 @@
+[package]
+name = "webtop-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "webtop-controller"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bollard.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+nix.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+tar.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+webtop-contracts.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
