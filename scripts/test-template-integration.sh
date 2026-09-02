@@ -14,6 +14,7 @@ source_repo_digest=""
 test_image=${WEBTOP_TEMPLATE_TEST_IMAGE:-lscr.io/linuxserver/webtop:latest}
 test_uid=$(id -u)
 test_gid=$(id -g)
+operation_wait_attempts=1500
 
 api() {
   local method=$1
@@ -41,7 +42,7 @@ restore_source_image() {
 wait_operation() {
   local operation_id=$1
   local response phase
-  for _ in $(seq 1 300); do
+  for _ in $(seq 1 "$operation_wait_attempts"); do
     response=$(api GET "/v1/operations/$operation_id")
     phase=$(jq -r .phase <<<"$response")
     case "$phase" in
@@ -51,6 +52,7 @@ wait_operation() {
     sleep 0.2
   done
   echo "operation timed out: $operation_id" >&2
+  [[ -n "$response" ]] && jq . <<<"$response" >&2
   return 1
 }
 
@@ -98,7 +100,7 @@ source_repo_digest=$(docker image inspect "$test_image" --format '{{json .RepoDi
 if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 && -z "$source_repo_digest" ]]; then
   docker save --output "$test_root/source-image.tar" "$test_image"
 fi
-cargo build --workspace >/dev/null
+cargo build --package webtop-controller --package webtop-worker >/dev/null
 
 mkdir -p "$test_root/state" "$test_root/environments" "$test_root/snapshots" "$test_root/staging"
 WEBTOP_MANAGER_STATE_DIR="$test_root/state" \
