@@ -12,6 +12,8 @@ imported_template_id=""
 source_image_id=""
 source_repo_digest=""
 test_image=${WEBTOP_TEMPLATE_TEST_IMAGE:-lscr.io/linuxserver/webtop:latest}
+test_uid=$(id -u)
+test_gid=$(id -g)
 
 api() {
   local method=$1
@@ -115,9 +117,9 @@ for _ in $(seq 1 100); do
 done
 api GET /v1/health | jq -e '.capabilities | index("template_transfer_v1")' >/dev/null
 
-source_spec=$(jq -n --arg image "$test_image" '{
+source_spec=$(jq -n --arg image "$test_image" --argjson uid "$test_uid" --argjson gid "$test_gid" '{
   name:"integration-source", image:$image,
-  identity:{uid:1000,gid:1000,timezone:"Etc/UTC",locale:"en_US.UTF-8"},
+  identity:{uid:$uid,gid:$gid,timezone:"Etc/UTC",locale:"en_US.UTF-8"},
   resources:{cpuLimit:null,memoryBytes:null,shmBytes:1073741824},
   display:{width:null,height:null,wayland:null,gpu:"disabled",audio:false,clipboard:false,fileTransfer:false,fileTransferMode:"none"},
   mounts:[], security:{dockerSocket:false,dockerSocketGid:null,privileged:false,seccomp:"default",devices:[]},
