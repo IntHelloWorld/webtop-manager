@@ -62,8 +62,11 @@ jobs:
       - name: Stage release assets and checksums
         run: |
           mkdir release-assets
-          cp target/release/bundle/deb/*.deb release-assets/
-          cp target/release/bundle/appimage/*.AppImage release-assets/
+          version=$(node -p "require('./package.json').version")
+          cp target/release/bundle/deb/*.deb \
+            "release-assets/webtop-manager_${version}_amd64.deb"
+          cp target/release/bundle/appimage/*.AppImage \
+            "release-assets/webtop-manager_${version}_amd64.AppImage"
           cd release-assets
           sha256sum ./*.deb ./*.AppImage | sort -k2 > SHA256SUMS
       - name: Upload Linux packages
