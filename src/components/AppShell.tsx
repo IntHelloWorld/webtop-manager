@@ -4,7 +4,7 @@ import { LanguageSwitcher } from "./LanguageSwitcher";
 import { ThemeSwitcher } from "./ThemeSwitcher";
 import type { ActiveOperation } from "./OperationFeedbackContext";
 
-export type Section = "environments" | "images" | "templates" | "settings";
+export type Section = "environments" | "guide" | "images" | "templates" | "settings";
 
 interface AppShellProps {
   section: Section;
@@ -13,7 +13,7 @@ interface AppShellProps {
   activeOperation: ActiveOperation | null;
 }
 
-const sections: Section[] = ["environments", "images", "templates", "settings"];
+const sections: Section[] = ["environments", "guide", "images", "templates", "settings"];
 
 export function AppShell({ section, onSectionChange, children, activeOperation }: AppShellProps) {
   const { t } = useTranslation();
@@ -45,9 +45,10 @@ export function AppShell({ section, onSectionChange, children, activeOperation }
       </aside>
       <main className="content">{children}</main>
     </div>
-    {activeOperation ? <section className="operation-lock" role="status" aria-live="assertive" aria-label={t("operationFeedback.title")}>
+    {activeOperation ? <section className="operation-lock">
       <span className="operation-spinner" aria-hidden="true" />
-      <div><strong>{t("operationFeedback.title")}</strong><p>{t(`operationFeedback.actions.${activeOperation.kind}`, { target: activeOperation.target })}</p></div>
+      <div role="status" aria-live="assertive" aria-label={t("operationFeedback.title")}><strong>{t("operationFeedback.title")}</strong><p>{t(`operationFeedback.actions.${activeOperation.kind}`, { target: activeOperation.target })}</p></div>
+      {activeOperation.cancel ? <button type="button" className="secondary operation-lock-cancel" onClick={activeOperation.cancel}>{t("common.cancel")}</button> : null}
     </section> : null}
   </>;
 }

@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use bollard::models::{ContainerCreateBody, HostConfig, RestartPolicy, RestartPolicyNameEnum};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, ImportImageOptionsBuilder, ListContainersOptionsBuilder,
-    ListImagesOptionsBuilder, RemoveContainerOptionsBuilder,
+    ListImagesOptionsBuilder, RemoveContainerOptionsBuilder, RenameContainerOptionsBuilder,
+    StopContainerOptionsBuilder,
 };
 use bollard::Docker;
 use futures_util::StreamExt;
@@ -22,8 +23,10 @@ const CONTROLLER_IMAGE: &str = concat!(
     env!("CARGO_PKG_VERSION")
 );
 const CONTROLLER_NAME: &str = "webtop-manager-controller";
+const CONTROLLER_BACKUP_NAME: &str = "controller-backup";
 const REQUIRED_CONTROLLER_CAPABILITIES: &[&str] = &[
     "frpc_lifecycle_v1",
+    "frp_token_recovery_v1",
     "frps_guide_v3",
     "host_environment_paths_v1",
     "environment_publication_v1",
@@ -35,6 +38,8 @@ const REQUIRED_CONTROLLER_CAPABILITIES: &[&str] = &[
     "operation_output_v1",
     "operation_cancel_v1",
     "template_publication_reconcile_v1",
+    "durable_image_pull_v1",
+    "controller_schema_v1",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +67,7 @@ pub struct BootStatus {
 
 pub struct AppPaths {
     pub state_dir: PathBuf,
+    pub state_backup_dir: PathBuf,
     pub environment_root: PathBuf,
     pub snapshot_root: PathBuf,
     pub staging_root: PathBuf,
@@ -75,18 +81,17 @@ impl AppPaths {
     pub fn resolve(app: &AppHandle) -> Result<Self, ApiError> {
         let data = app.path().app_data_dir().map_err(|_| internal())?;
         let state_dir = data.join("controller");
+        let state_backup_dir = data.join(CONTROLLER_BACKUP_NAME);
         let environment_root = data.join("environments");
         let snapshot_root = data.join("snapshots");
         let staging_root = data.join("staging");
-        let runtime_base = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| data.join("runtime"));
-        let runtime_dir = runtime_base.join("webtop-manager");
+        let runtime_dir = persistent_runtime_dir(&data);
         let controller_socket = runtime_dir.join("controller.sock");
         let host_uid = nix::unistd::getuid().as_raw();
         let host_gid = nix::unistd::getgid().as_raw();
         Ok(Self {
             state_dir,
+            state_backup_dir,
             environment_root,
             snapshot_root,
             staging_root,
@@ -114,6 +119,14 @@ impl AppPaths {
         }
         Ok(())
     }
+}
+
+fn persistent_runtime_dir(data_dir: &Path) -> PathBuf {
+    // The controller has an `unless-stopped` restart policy, so its bind-mount
+    // source must survive logout and reboot. If this lived in XDG_RUNTIME_DIR,
+    // Docker could restart first and recreate the missing directory as root,
+    // preventing the unprivileged controller from binding its Unix socket.
+    data_dir.join("runtime").join("webtop-manager")
 }
 
 pub async fn docker_diagnostics_impl(app: &AppHandle) -> Result<BootStatus, ApiError> {
@@ -172,7 +185,7 @@ pub async fn docker_diagnostics_impl(app: &AppHandle) -> Result<BootStatus, ApiE
         )
         .await
         .ok();
-    let controller_is_compatible = has_required_controller_capability(controller_health.as_ref());
+    let controller_is_compatible = has_compatible_controller(controller_health.as_ref());
     let state = if controller_is_compatible {
         BootState::Ready
     } else {
@@ -217,7 +230,14 @@ pub async fn bootstrap_controller_impl(app: &AppHandle) -> Result<BootStatus, Ap
         ))
         .await
         .map_err(|_| docker_unavailable())?;
-    if let Some(container) = containers.first() {
+    let controller = containers.into_iter().find(|container| {
+        container.names.as_ref().is_some_and(|names| {
+            names
+                .iter()
+                .any(|name| name == &format!("/{CONTROLLER_NAME}"))
+        })
+    });
+    if let Some(container) = controller {
         let id = container.id.as_deref().ok_or_else(internal)?;
         let managed = container.labels.as_ref().is_some_and(|labels| {
             labels.get(OWNER_LABEL).map(String::as_str) == Some("managed")
@@ -230,35 +250,267 @@ pub async fn bootstrap_controller_impl(app: &AppHandle) -> Result<BootStatus, Ap
             });
         }
 
-        // A controller can be healthy according to an older API while lacking
-        // routes required by the current desktop app. Import the bundled image
-        // before replacing the app-owned container so an import failure leaves
-        // the existing process untouched. Persistent state lives in bind mounts.
+        // Import before stopping the existing controller. An invalid bundle
+        // therefore cannot disturb the last-known-good process.
         ensure_controller_image(app, &docker, true).await?;
-        docker
+        stop_controller_if_running(&docker, id).await?;
+        if let Err(error) = backup_controller_state(&paths).await {
+            let _ = docker.start_container(id, None).await;
+            return Err(error);
+        }
+
+        let candidate_name = format!("{CONTROLLER_NAME}-candidate-{}", uuid::Uuid::new_v4());
+        let candidate_id = match create_controller(&docker, &paths, &candidate_name).await {
+            Ok(candidate_id) => candidate_id,
+            Err(error) => {
+                restore_state_and_restart(&docker, &paths, id).await?;
+                return Err(error);
+            }
+        };
+        if wait_for_current_controller(app).await.is_none() {
+            rollback_controller_upgrade(&docker, &paths, id, &candidate_id, false).await?;
+            return Err(controller_unavailable());
+        }
+
+        let rollback_name = format!("{CONTROLLER_NAME}-rollback-{}", uuid::Uuid::new_v4());
+        if docker
+            .rename_container(
+                id,
+                RenameContainerOptionsBuilder::default()
+                    .name(&rollback_name)
+                    .build(),
+            )
+            .await
+            .is_err()
+        {
+            rollback_controller_upgrade(&docker, &paths, id, &candidate_id, false).await?;
+            return Err(docker_unavailable());
+        }
+        if docker
+            .rename_container(
+                &candidate_id,
+                RenameContainerOptionsBuilder::default()
+                    .name(CONTROLLER_NAME)
+                    .build(),
+            )
+            .await
+            .is_err()
+        {
+            rollback_controller_upgrade(&docker, &paths, id, &candidate_id, true).await?;
+            return Err(docker_unavailable());
+        }
+        // The healthy candidate has already taken the stable name. A stale
+        // stopped rollback container is harmless and can be cleaned up on the
+        // next bootstrap, so do not turn a successful upgrade into a failure.
+        let _ = docker
             .remove_container(
                 id,
                 Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
-            .await
-            .map_err(|_| docker_unavailable())?;
-        create_controller(&docker, &paths).await?;
+            .await;
     } else {
         ensure_controller_image(app, &docker, false).await?;
-        create_controller(&docker, &paths).await?;
+        create_controller(&docker, &paths, CONTROLLER_NAME).await?;
     }
 
+    if let Some(status) = wait_for_current_controller(app).await {
+        return Ok(status);
+    }
+    Err(controller_unavailable())
+}
+
+async fn wait_for_current_controller(app: &AppHandle) -> Option<BootStatus> {
     for _ in 0..40 {
         sleep(Duration::from_millis(250)).await;
-        let status = docker_diagnostics_impl(app).await?;
-        if matches!(status.state, BootState::Ready) {
-            return Ok(status);
+        if let Ok(status) = docker_diagnostics_impl(app).await {
+            if matches!(status.state, BootState::Ready) {
+                return Some(status);
+            }
         }
     }
-    Err(ApiError {
-        code: ErrorCode::ControllerUnavailable,
-        params: BTreeMap::new(),
-    })
+    None
+}
+
+async fn stop_controller_if_running(docker: &Docker, id: &str) -> Result<(), ApiError> {
+    let inspect = docker
+        .inspect_container(id, None)
+        .await
+        .map_err(|_| docker_unavailable())?;
+    if inspect.state.and_then(|state| state.running) == Some(true) {
+        docker
+            .stop_container(
+                id,
+                Some(StopContainerOptionsBuilder::default().t(20).build()),
+            )
+            .await
+            .map_err(|_| docker_unavailable())?;
+    }
+    Ok(())
+}
+
+async fn rollback_controller_upgrade(
+    docker: &Docker,
+    paths: &AppPaths,
+    previous_id: &str,
+    candidate_id: &str,
+    restore_previous_name: bool,
+) -> Result<(), ApiError> {
+    let _ = docker
+        .remove_container(
+            candidate_id,
+            Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+        )
+        .await;
+    let rename_failed = if restore_previous_name {
+        docker
+            .rename_container(
+                previous_id,
+                RenameContainerOptionsBuilder::default()
+                    .name(CONTROLLER_NAME)
+                    .build(),
+            )
+            .await
+            .is_err()
+    } else {
+        false
+    };
+    let restore_result = rollback_controller_state(paths).await;
+    let restart_result = docker
+        .start_container(previous_id, None)
+        .await
+        .map_err(|_| docker_unavailable());
+    if rename_failed {
+        return Err(docker_unavailable());
+    }
+    restore_result?;
+    restart_result
+}
+
+async fn restore_state_and_restart(
+    docker: &Docker,
+    paths: &AppPaths,
+    previous_id: &str,
+) -> Result<(), ApiError> {
+    let restore_result = rollback_controller_state(paths).await;
+    let restart_result = docker
+        .start_container(previous_id, None)
+        .await
+        .map_err(|_| docker_unavailable());
+    restore_result?;
+    restart_result
+}
+
+async fn backup_controller_state(paths: &AppPaths) -> Result<(), ApiError> {
+    let source = paths.state_dir.clone();
+    let backup = paths.state_backup_dir.clone();
+    tokio::task::spawn_blocking(move || replace_backup(&source, &backup))
+        .await
+        .map_err(|_| internal())?
+        .map_err(|_| internal())
+}
+
+async fn rollback_controller_state(paths: &AppPaths) -> Result<(), ApiError> {
+    let backup = paths.state_backup_dir.clone();
+    let destination = paths.state_dir.clone();
+    tokio::task::spawn_blocking(move || restore_backup(&backup, &destination))
+        .await
+        .map_err(|_| internal())?
+        .map_err(|_| internal())
+}
+
+fn replace_backup(source: &Path, backup: &Path) -> std::io::Result<()> {
+    let parent = backup.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "backup has no parent")
+    })?;
+    let partial = parent.join(format!(
+        ".{CONTROLLER_BACKUP_NAME}.partial-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let previous = parent.join(format!(
+        ".{CONTROLLER_BACKUP_NAME}.previous-{}",
+        uuid::Uuid::new_v4()
+    ));
+    if let Err(error) = copy_tree(source, &partial) {
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(error);
+    }
+    let had_previous = backup.exists();
+    if had_previous {
+        std::fs::rename(backup, &previous)?;
+    }
+    if let Err(error) = std::fs::rename(&partial, backup) {
+        if had_previous {
+            let _ = std::fs::rename(&previous, backup);
+        }
+        let _ = std::fs::remove_dir_all(&partial);
+        return Err(error);
+    }
+    if had_previous {
+        std::fs::remove_dir_all(previous)?;
+    }
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn restore_backup(backup: &Path, destination: &Path) -> std::io::Result<()> {
+    if !backup.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "controller backup is missing",
+        ));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "state has no parent")
+    })?;
+    let restored = parent.join(format!(".controller-restored-{}", uuid::Uuid::new_v4()));
+    let failed = parent.join(format!(".controller-failed-{}", uuid::Uuid::new_v4()));
+    if let Err(error) = copy_tree(backup, &restored) {
+        let _ = std::fs::remove_dir_all(&restored);
+        return Err(error);
+    }
+    std::fs::rename(destination, &failed)?;
+    if let Err(error) = std::fs::rename(&restored, destination) {
+        let _ = std::fs::rename(&failed, destination);
+        let _ = std::fs::remove_dir_all(&restored);
+        return Err(error);
+    }
+    std::fs::remove_dir_all(failed)?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "controller state root must be a real directory",
+        ));
+    }
+    std::fs::create_dir(destination)?;
+    std::fs::set_permissions(destination, metadata.permissions())?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source_path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "symlinks are forbidden in controller state",
+            ));
+        }
+        if metadata.is_dir() {
+            copy_tree(&source_path, &destination_path)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&source_path, &destination_path)?;
+            std::fs::set_permissions(&destination_path, metadata.permissions())?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "special files are forbidden in controller state",
+            ));
+        }
+    }
+    std::fs::File::open(destination)?.sync_all()
 }
 
 async fn ensure_controller_image(
@@ -328,7 +580,11 @@ async fn ensure_controller_image(
     Ok(())
 }
 
-async fn create_controller(docker: &Docker, paths: &AppPaths) -> Result<(), ApiError> {
+async fn create_controller(
+    docker: &Docker,
+    paths: &AppPaths,
+    container_name: &str,
+) -> Result<String, ApiError> {
     let docker_socket_gid = tokio::fs::metadata(DOCKER_SOCKET)
         .await
         .map_err(|_| docker_unavailable())?
@@ -376,18 +632,23 @@ async fn create_controller(docker: &Docker, paths: &AppPaths) -> Result<(), ApiE
         .create_container(
             Some(
                 CreateContainerOptionsBuilder::default()
-                    .name(CONTROLLER_NAME)
+                    .name(container_name)
                     .build(),
             ),
             config,
         )
         .await
         .map_err(|_| docker_unavailable())?;
-    docker
-        .start_container(&response.id, None)
-        .await
-        .map_err(|_| docker_unavailable())?;
-    Ok(())
+    if docker.start_container(&response.id, None).await.is_err() {
+        let _ = docker
+            .remove_container(
+                &response.id,
+                Some(RemoveContainerOptionsBuilder::default().force(true).build()),
+            )
+            .await;
+        return Err(docker_unavailable());
+    }
+    Ok(response.id)
 }
 
 fn status(
@@ -423,6 +684,13 @@ fn controller_image_missing() -> ApiError {
     }
 }
 
+fn controller_unavailable() -> ApiError {
+    ApiError {
+        code: ErrorCode::ControllerUnavailable,
+        params: BTreeMap::new(),
+    }
+}
+
 fn internal() -> ApiError {
     ApiError {
         code: ErrorCode::Internal,
@@ -430,7 +698,14 @@ fn internal() -> ApiError {
     }
 }
 
-fn has_required_controller_capability(health: Option<&serde_json::Value>) -> bool {
+fn has_compatible_controller(health: Option<&serde_json::Value>) -> bool {
+    if health
+        .and_then(|value| value.get("controllerVersion"))
+        .and_then(serde_json::Value::as_str)
+        != Some(env!("CARGO_PKG_VERSION"))
+    {
+        return false;
+    }
     let Some(capabilities) = health
         .and_then(|value| value.get("capabilities"))
         .and_then(serde_json::Value::as_array)
@@ -446,27 +721,105 @@ fn has_required_controller_capability(health: Option<&serde_json::Value>) -> boo
 
 #[cfg(test)]
 mod tests {
-    use super::has_required_controller_capability;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::Path;
+
+    use tempfile::tempdir;
+
+    use super::{
+        copy_tree, has_compatible_controller, persistent_runtime_dir, replace_backup,
+        restore_backup,
+    };
+
+    #[test]
+    fn controller_runtime_directory_is_persistent_application_data() {
+        let data_dir = Path::new("/home/example/.local/share/com.cue.webtop-manager");
+
+        assert_eq!(
+            persistent_runtime_dir(data_dir),
+            data_dir.join("runtime/webtop-manager")
+        );
+    }
 
     #[test]
     fn rejects_controller_health_missing_required_capabilities() {
         let legacy = serde_json::json!({
             "apiVersion": "v1",
-            "controllerVersion": "0.1.0"
+            "controllerVersion": env!("CARGO_PKG_VERSION")
         });
         let current = serde_json::json!({
             "apiVersion": "v1",
-            "controllerVersion": "0.1.0",
-            "capabilities": ["frpc_lifecycle_v1", "frps_guide_v2", "frps_guide_v3", "host_environment_paths_v1", "environment_publication_v1", "environment_credentials_v1", "official_image_delete_v1", "templates_v1", "template_transfer_v1", "operations_v1", "operation_output_v1", "operation_cancel_v1", "template_publication_reconcile_v1"]
+            "controllerVersion": env!("CARGO_PKG_VERSION"),
+            "capabilities": ["frpc_lifecycle_v1", "frp_token_recovery_v1", "frps_guide_v2", "frps_guide_v3", "host_environment_paths_v1", "environment_publication_v1", "environment_credentials_v1", "official_image_delete_v1", "templates_v1", "template_transfer_v1", "operations_v1", "operation_output_v1", "operation_cancel_v1", "template_publication_reconcile_v1", "durable_image_pull_v1", "controller_schema_v1"]
         });
         let previous = serde_json::json!({
             "apiVersion": "v1",
-            "controllerVersion": "0.1.0",
+            "controllerVersion": env!("CARGO_PKG_VERSION"),
             "capabilities": ["frpc_lifecycle_v1", "frps_guide_v2", "frps_guide_v3", "host_environment_paths_v1", "environment_publication_v1", "environment_credentials_v1", "official_image_delete_v1", "templates_v1", "template_transfer_v1", "operations_v1", "operation_output_v1", "operation_cancel_v1"]
         });
 
-        assert!(!has_required_controller_capability(Some(&legacy)));
-        assert!(!has_required_controller_capability(Some(&previous)));
-        assert!(has_required_controller_capability(Some(&current)));
+        let old_version = serde_json::json!({
+            "controllerVersion": "0.0.0",
+            "capabilities": current["capabilities"].clone()
+        });
+
+        assert!(!has_compatible_controller(Some(&legacy)));
+        assert!(!has_compatible_controller(Some(&previous)));
+        assert!(!has_compatible_controller(Some(&old_version)));
+        assert!(has_compatible_controller(Some(&current)));
+    }
+
+    #[test]
+    fn controller_backup_preserves_state_and_permissions() {
+        let directory = tempdir().unwrap();
+        let state = directory.path().join("controller");
+        let backup = directory.path().join("controller-backup");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::create_dir(state.join("secrets")).unwrap();
+        std::fs::write(state.join("controller.sqlite3"), b"schema-v1").unwrap();
+        std::fs::write(state.join("secrets/frp-token"), b"secret-token").unwrap();
+        std::fs::set_permissions(
+            state.join("secrets/frp-token"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        replace_backup(&state, &backup).unwrap();
+        std::fs::write(state.join("controller.sqlite3"), b"broken-migration").unwrap();
+        restore_backup(&backup, &state).unwrap();
+
+        assert_eq!(
+            std::fs::read(state.join("controller.sqlite3")).unwrap(),
+            b"schema-v1"
+        );
+        assert_eq!(
+            std::fs::read(state.join("secrets/frp-token")).unwrap(),
+            b"secret-token"
+        );
+        assert_eq!(
+            std::fs::metadata(state.join("secrets/frp-token"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn controller_backup_rejects_symlinks() {
+        let directory = tempdir().unwrap();
+        let state = directory.path().join("controller");
+        let destination = directory.path().join("copy");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(directory.path().join("outside"), b"secret").unwrap();
+        symlink(
+            directory.path().join("outside"),
+            state.join("unexpected-link"),
+        )
+        .unwrap();
+
+        let error = copy_tree(&state, &destination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
     }
 }

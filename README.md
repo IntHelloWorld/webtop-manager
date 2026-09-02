@@ -1,129 +1,168 @@
-# Webtop Manager
+<div align="center">
+  <img src="src-tauri/icons/app-icon.svg" width="112" height="112" alt="Webtop Manager logo">
+  <h1>Webtop Manager</h1>
+  <p><strong>Put a Linux desktop in your pocket and open it wherever you are.</strong></p>
+  <p>
+    Skip hand-written Compose files, repeated setup, and painful migrations: create, manage,<br>
+    remotely access, and move persistent Linux desktops on local Docker from one secure app.
+  </p>
+  <p>
+    <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+  </p>
+  <p>
+    <a href="https://github.com/IntHelloWorld/webtop-manager/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/IntHelloWorld/webtop-manager/actions/workflows/ci.yml/badge.svg"></a>
+    <a href="docs/v1-status.md"><img alt="Version: 1.0" src="https://img.shields.io/badge/version-1.0.0-2563eb"></a>
+    <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2ea44f"></a>
+    <img alt="Platform: Linux x86-64" src="https://img.shields.io/badge/platform-Linux%20x86__64-fcc624?logo=linux&logoColor=black">
+    <img alt="Tauri 2" src="https://img.shields.io/badge/Tauri-2-24c8db?logo=tauri&logoColor=white">
+  </p>
+</div>
 
-Webtop Manager is a bilingual Linux desktop application for creating and
-operating private [LinuxServer Webtop](https://docs.linuxserver.io/images/docker-webtop/)
-environments on a local Docker Engine. It uses Tauri 2, React/TypeScript, and a
-persistent Rust controller with a typed Unix Socket API.
+![Webtop Manager user guide interface](docs/images/user-guide.en.png)
 
-> **Project status: alpha preview.** The current release is intended for
-> evaluation and personal testing. It is not yet a security-complete stable v1;
-> review the [known acceptance gaps](docs/v1-status.md#required-before-full-v1-acceptance)
-> before installing it on an important host.
+## Why Webtop Manager?
 
-## Supported scope
+[LinuxServer Webtop](https://docs.linuxserver.io/images/docker-webtop/) puts a
+full Linux desktop in your browser. Webtop Manager turns it into a focused
+desktop workflow: choose an official image, configure an environment, and let
+the app handle its lifecycle without hand-editing Compose files.
 
-- Linux x86_64; Ubuntu 24.04 is the currently tested distribution.
-- A local Docker Engine that is installed and administered separately.
-- New Webtop Manager environments only. Existing Compose projects and
-  containers are never imported, adopted, modified, or deleted.
-- `.deb` and AppImage packages produced by GitHub Actions.
-- No automatic updater in the alpha release.
+- **Local first** — your Docker daemon, configuration, and desktop data stay on
+  infrastructure you control.
+- **Safe ownership boundaries** — only fully labeled, app-owned resources are
+  managed; existing Compose projects and containers are left alone.
+- **Durable by design** — Webtops, tunnels, and long template operations keep
+  running after the UI closes.
+- **Portable environments** — export a versioned `.wtmpl` containing both the
+  container image and the complete `/config` data, then validate it offline on
+  import.
+- **Remote access on your terms** — publication is off by default and enabled
+  per environment through a managed FRP client.
 
-## Features
+## What you can do
 
-- Create, start, stop, restart, and safely delete application-owned Webtops.
-- Browse and pull an allowlisted catalog of official LinuxServer images.
-- Configure a shared frpc client and explicitly publish individual environments.
-- Create portable multi-layer templates with a separate complete `/config`
-  snapshot, then import or export versioned `.wtmpl` packages.
-- Keep long template operations in the controller so they survive UI closure.
-- Show bounded, redacted progress without exposing arbitrary command output.
-- Use Simplified Chinese or English throughout the desktop interface.
+| | Capability | Highlights |
+| --- | --- | --- |
+| 🖥️ | **Manage Webtops** | Create, start, stop, restart, and safely delete app-owned environments. |
+| 🧩 | **Choose official images** | Browse an allowlisted LinuxServer catalog, detect local images, and follow pull progress. |
+| 🎛️ | **Configure without guesswork** | Use guided options for desktop, locale, devices, mounts, and advanced Webtop settings. |
+| 📦 | **Create portable templates** | Preserve image layers and the full `/config`; import and export verified `.wtmpl` packages. |
+| 🌐 | **Publish explicitly** | Configure one shared frpc and publish individual environments with generated public links. |
+| 🛡️ | **Keep risky operations contained** | Use typed APIs, canonical path checks, ownership labels, and secret files instead of arbitrary shell or Docker commands. |
+| 🌏 | **Work in your language** | Switch the complete interface between English and Simplified Chinese. |
 
-## Security warning
+## Quick start
 
-Access to `/var/run/docker.sock` is effectively root-equivalent. Webtop Manager
-keeps that access behind a persistent controller, a mode-`0600` Unix Socket,
-typed operations, ownership labels, and canonical path checks, but installing
-the application still grants it control over the local Docker daemon.
+### 1. Check compatibility
 
-Internet publication is disabled by default and requires explicit confirmation.
-The alpha release provides personal-use TCP forwarding, not a complete reverse
-proxy or enterprise authentication layer. Read the [security model](docs/security.md)
-and [FRP setup guide](docs/frps-setup.md) before enabling publication.
+| Requirement | Version 1.0 support |
+| --- | --- |
+| Operating system | Linux x86_64 |
+| Tested distribution | Ubuntu 24.04 |
+| Container runtime | Local Docker Engine |
+| Managed environments | Newly created by Webtop Manager only |
+| Packages | Debian package and AppImage |
 
-Portable `.wtmpl` files and snapshots are not encrypted. They may contain SSH
-keys, browser profiles, cloud credentials, and other secrets copied from
-`/config`. Never attach them to issues or commit them to a repository.
+Docker Engine is a prerequisite and must be installed and administered
+separately. Webtop Manager never installs Docker, changes group membership, or
+weakens Docker Socket permissions.
 
-## Install a pre-release
+### 2. Download and verify
 
-1. Install Docker Engine using your distribution or administrator's process.
-   The application never installs Docker, changes Docker groups, or modifies
-   Socket permissions.
-2. Download `SHA256SUMS` and either the `.deb` or AppImage from the repository's
-   GitHub Releases page.
-3. Verify the downloaded package in the directory containing `SHA256SUMS`:
+Published builds appear on the [Releases
+page](https://github.com/IntHelloWorld/webtop-manager/releases). Download
+`SHA256SUMS` and the `.deb` or AppImage, then verify the package in the download
+directory. If the 1.0 release has not been published yet, use the development
+setup below.
 
-   ```bash
-   sha256sum --check SHA256SUMS --ignore-missing
-   ```
-
-4. Install the Debian package:
-
-   ```bash
-   sudo apt install ./path/to/webtop-manager.deb
-   ```
-
-   Or run the AppImage without installing it:
-
-   ```bash
-   chmod +x ./path/to/webtop-manager.AppImage
-   ./path/to/webtop-manager.AppImage
-   ```
-
-The desktop remains launchable when Docker is missing or inaccessible and will
-show a diagnostic state. Docker access must be fixed by the host administrator;
-the application deliberately does not weaken host permissions.
-
-## Architecture
-
-```text
-React WebView
-  | fixed Tauri commands and redacted events
-Tauri desktop process
-  | mode-0600 Unix Socket, versioned /v1 API
-Persistent controller container
-  | local Docker Socket
-Owned Webtops, frpc, isolated workers, SQLite state, and /config data
+```bash
+sha256sum --check SHA256SUMS --ignore-missing
 ```
 
-Only resources carrying the complete `com.cue.webtop-manager.*` ownership label
-set are managed. The WebView cannot send shell fragments, arbitrary Docker JSON,
-host paths for deletion, or generic URL-open requests. See
-[docs/architecture.md](docs/architecture.md) for the detailed process and state
-model.
+### 3. Install or run
 
-## Repository layout
+```bash
+# Debian / Ubuntu
+sudo apt install ./webtop-manager_*_amd64.deb
 
-- `src`: React UI, localization, typed API client, and frontend tests.
-- `src-tauri`: Docker diagnostics, controller bootstrap, native dialogs, and
-  strict Tauri commands.
-- `crates/contracts`: versioned, secret-free contracts and safety validation.
-- `crates/controller`: persistent `/v1` API, SQLite state, Docker operations,
-  templates, images, and FRP lifecycle.
-- `crates/worker`: network-isolated snapshot, preflight, and restore worker.
-- `scripts`: repeatable setup, diagnostics, checks, development, and packaging.
-- `docs`: architecture, development, security, FRP, and implementation status.
+# AppImage
+chmod +x ./webtop-manager_*_amd64.AppImage
+./webtop-manager_*_amd64.AppImage
+```
+
+If Docker is missing or inaccessible, the app still opens and shows diagnostic
+guidance. Host access remains an administrator decision.
+
+## Security by design
+
+Webtop Manager deliberately exposes a narrow management surface:
+
+- The WebView can call fixed Tauri commands, not arbitrary shell, Docker JSON,
+  host paths, or URLs.
+- A persistent Rust controller serves a versioned API over a mode-`0600` Unix
+  Socket and reconciles only resources with the complete
+  `com.cue.webtop-manager.*` label set.
+- Passwords and FRP tokens are stored in protected files rather than Docker
+  environment values, SQLite rows, logs, or frontend events.
+- FRP tokens are generated once and reused across app reinstalls. If the local
+  secret is lost, a fingerprint-backed recovery flow re-pairs the managed frps
+  without exposing routine token rotation.
+- Internet publication starts disabled and requires explicit confirmation for
+  each environment.
+- Managed-data deletion uses canonical containment checks. External mounts are
+  never deleted automatically.
+
+> [!WARNING]
+> Access to `/var/run/docker.sock` is effectively root-equivalent. Installing
+> Webtop Manager grants its controller control over the local Docker daemon.
+> Read the [security model](docs/security.md) before installation and the
+> [FRP guide](docs/frps-setup.md) before exposing a Webtop publicly.
+
+> [!CAUTION]
+> Templates and snapshots are **not encrypted**. A `.wtmpl` may contain SSH
+> keys, browser profiles, cloud credentials, and other secrets from `/config`.
+> Never commit one to a repository or attach one to a public issue.
+
+## How it works
+
+```text
+┌─────────────────────┐
+│ React + TypeScript  │  Bilingual desktop UI
+└──────────┬──────────┘
+           │ allowlisted Tauri commands + redacted events
+┌──────────▼──────────┐
+│ Tauri 2 desktop app │  Diagnostics, bootstrap, native file transfer
+└──────────┬──────────┘
+           │ mode-0600 Unix Socket · versioned /v1 API
+┌──────────▼──────────┐
+│ Rust controller     │  Persistent lifecycle and SQLite state
+└──────────┬──────────┘
+           │ local Docker Socket
+┌──────────▼────────────────────────────────────────────┐
+│ Owned Webtops · frpc · isolated workers · /config    │
+└───────────────────────────────────────────────────────┘
+```
+
+The desktop UI can close without taking down managed environments, FRP
+tunnels, or active template operations. For the complete trust and state model,
+see [Architecture](docs/architecture.md).
 
 ## Development
 
-Prerequisites are Linux x86_64, Docker Engine, Tauri 2 Linux system libraries,
-Rust 1.88.0, Node.js 22.23.2, pnpm 10.4.1, and `zstd`.
-
-On Ubuntu 24.04:
+The reproducible development setup targets Ubuntu 24.04 x86_64 with Rust
+1.88.0, Node.js 22.23.2, pnpm 10.4.1, Docker Engine, `zstd`, and the Tauri 2
+Linux system libraries.
 
 ```bash
+git clone https://github.com/IntHelloWorld/webtop-manager.git
+cd webtop-manager
+
 ./scripts/setup-dev.sh --install-system-deps
 ./scripts/doctor.sh
 ./scripts/dev.sh
 ```
 
-The setup script prompts for sudo only when system packages are missing. It
-does not install Docker or change Docker access. See the
-[development guide](docs/development.md) for toolchain details and troubleshooting.
-
-Run all repository checks with:
+Run the repository checks:
 
 ```bash
 ./scripts/check.sh
@@ -131,50 +170,45 @@ cargo check --package webtop-manager --locked
 ./scripts/check-release-version.sh
 ```
 
-To rebuild the embedded controller after controller, worker, or API changes:
+After changing the controller, worker, or API, rebuild and verify the embedded
+controller image:
 
 ```bash
 ./scripts/package-controller.sh
 zstd --test --quiet src-tauri/assets/controller-image.tar.zst
+./scripts/test-packaged-controller.sh
 ```
 
-The generated OCI archive is intentionally ignored by Git. GitHub Actions
-rebuilds and verifies it before creating release packages.
+See the [development guide](docs/development.md) for prerequisites,
+troubleshooting, and additional commands.
 
-## Release process
+## Project status and roadmap
 
-The release workflow is also manually dispatchable. A manual run builds and
-uploads installation artifacts without creating a GitHub Release, making it the
-recommended dress rehearsal before tagging.
+Version 1.0 covers the complete create/manage/publish/template flow, durable
+image-pull recovery, FRP port-race retry, controller upgrade rollback, and
+Docker-backed release acceptance. Safe environment rebuilds, general-purpose
+image administration, and user-configurable storage roots are explicitly
+outside the 1.0 scope. See [v1 implementation status](docs/v1-status.md).
 
-For a tagged alpha release:
+No automatic updater is included in version 1.0.
 
-1. Move completed entries in `CHANGELOG.md` under the release version and date.
-2. Update the version in `Cargo.toml`, `package.json`, and
-   `src-tauri/tauri.conf.json`.
-3. Run the local checks and verify the exact tag:
+## Documentation
 
-   ```bash
-   ./scripts/check.sh
-   cargo check --package webtop-manager --locked
-   ./scripts/check-release-version.sh v0.1.0
-   ```
+- [Architecture](docs/architecture.md) — processes, ownership, state, and API boundaries
+- [Security model](docs/security.md) — enforced invariants and exposure risks
+- [Development guide](docs/development.md) — setup, validation, and troubleshooting
+- [Remote FRP setup](docs/frps-setup.md) — server deployment and verification
+- [v1 status](docs/v1-status.md) — accepted scope and explicit non-goals
+- [Changelog](CHANGELOG.md) — notable project changes
 
-4. Push `main`, run the `release` workflow manually, and install-test its
-   artifact on a clean Ubuntu 24.04 x86_64 host with Docker.
-5. Create and push the matching `v<version>` tag. The tag run publishes the
-   `.deb`, AppImage, and `SHA256SUMS` as a GitHub pre-release.
+## Contributing
 
-The workflow rejects a tag that differs from the Cargo, frontend, or Tauri
-version and grants write access only to the final publishing job.
-
-## Contributing and security reports
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report
+Contributions and focused bug reports are welcome. Please read
+[CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Report
 security vulnerabilities privately according to [SECURITY.md](SECURITY.md),
 never through a public issue.
 
 ## License
 
-Webtop Manager is licensed under the [MIT License](LICENSE). Third-party
+Webtop Manager is available under the [MIT License](LICENSE). Third-party
 components remain subject to their respective licenses.

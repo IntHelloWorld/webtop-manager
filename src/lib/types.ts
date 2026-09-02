@@ -63,6 +63,7 @@ export interface ServerSettings {
   remotePortStart: number;
   remotePortEnd: number;
   tokenConfigured: boolean;
+  tokenState: "ready" | "missing" | "recovery_pending";
   frpcImage: string;
 }
 

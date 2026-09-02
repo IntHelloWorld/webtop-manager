@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -14,13 +14,15 @@ use bytes::Bytes;
 use chrono::Utc;
 use rand::distr::{Alphanumeric, SampleString};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, watch, Mutex};
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 use webtop_contracts::{
     allocate_remote_port, ApiError, EnvironmentSpec, ErrorCode, FrpcServiceState,
     FrpcServiceStatus, FrpcTestResult, ImageCachePruneResult, ImagePullPhase, ImagePullProgress,
-    OfficialImage, ServerSettings, API_VERSION,
+    OfficialImage, Operation, OperationKind, OperationPhase, ServerSettings, ServerTokenState,
+    API_VERSION,
 };
 
 use crate::database::{Database, EnvironmentRecord};
@@ -35,9 +37,12 @@ pub struct AppState {
     pub snapshot_root: PathBuf,
     pub staging_root: PathBuf,
     pub server_token_path: PathBuf,
+    pub frpc_container_name: String,
     pub pull_cancellations: Arc<Mutex<HashMap<Uuid, watch::Sender<bool>>>>,
     pub operation_cancellations: Arc<Mutex<HashMap<Uuid, watch::Sender<bool>>>>,
     pub active_resources: Arc<Mutex<HashSet<String>>>,
+    pub publication_lock: Arc<Mutex<()>>,
+    pub token_lock: Arc<Mutex<()>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -60,8 +65,8 @@ pub fn router(state: AppState) -> Router {
             get(get_server_settings).put(update_server_settings),
         )
         .route(
-            "/v1/settings/server/token/regenerate",
-            post(regenerate_server_token),
+            "/v1/settings/server/token/recover",
+            post(recover_server_token),
         )
         .route("/v1/frps/setup", get(get_frps_setup_guide))
         .route("/v1/frpc", get(get_frpc_status))
@@ -91,7 +96,7 @@ pub fn router(state: AppState) -> Router {
 struct HealthResponse {
     api_version: &'static str,
     controller_version: &'static str,
-    capabilities: [&'static str; 13],
+    capabilities: [&'static str; 16],
     docker_version: Option<String>,
 }
 
@@ -102,6 +107,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         controller_version: env!("CARGO_PKG_VERSION"),
         capabilities: [
             "frpc_lifecycle_v1",
+            "frp_token_recovery_v1",
             "frps_guide_v2",
             "frps_guide_v3",
             "host_environment_paths_v1",
@@ -114,6 +120,8 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
             "operation_output_v1",
             "operation_cancel_v1",
             "template_publication_reconcile_v1",
+            "durable_image_pull_v1",
+            "controller_schema_v1",
         ],
         docker_version: version.version,
     }))
@@ -208,7 +216,7 @@ async fn delete_official_image(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PullImageRequest {
     pull_id: Uuid,
@@ -222,6 +230,29 @@ async fn pull_official_image(
     if !docker::is_official_image(&request.reference) {
         return Err(ApiFailure::invalid_request());
     }
+    if let Some(existing) = state
+        .database
+        .get_operation(request.pull_id)
+        .await
+        .map_err(ApiFailure::internal)?
+    {
+        let stored = state
+            .database
+            .get_operation_request::<PullImageRequest>(request.pull_id)
+            .await
+            .map_err(ApiFailure::internal)?;
+        if existing.kind != OperationKind::PullImage
+            || stored.as_ref().map(|value| value.reference.as_str())
+                != Some(request.reference.as_str())
+        {
+            return Err(ApiFailure::invalid_request());
+        }
+        return Ok(reattach_image_pull_stream(
+            state.database.clone(),
+            request.pull_id,
+            request.reference,
+        ));
+    }
     {
         let mut resources = state.active_resources.lock().await;
         if resources.contains("docker-images") {
@@ -230,6 +261,7 @@ async fn pull_official_image(
         resources.insert("docker-images".into());
     }
     let (cancel_tx, cancel_rx) = watch::channel(false);
+    let operation_cancel_tx = cancel_tx.clone();
     {
         let mut cancellations = state.pull_cancellations.lock().await;
         if cancellations.contains_key(&request.pull_id) {
@@ -238,35 +270,32 @@ async fn pull_official_image(
         }
         cancellations.insert(request.pull_id, cancel_tx);
     }
-    let (event_tx, event_rx) = mpsc::channel::<ImagePullProgress>(32);
-    let docker = state.docker.clone();
-    let cancellations = state.pull_cancellations.clone();
-    let active_resources = state.active_resources.clone();
-    let reference = request.reference.clone();
-    let pull_id = request.pull_id;
-    tokio::spawn(async move {
-        if let Err(error) =
-            docker::pull_official_image(&docker, pull_id, &reference, cancel_rx, event_tx.clone())
-                .await
-        {
-            tracing::warn!(%error, %pull_id, %reference, "Docker image pull failed");
-            let _ = event_tx
-                .send(ImagePullProgress {
-                    pull_id,
-                    reference,
-                    phase: ImagePullPhase::Error,
-                    layer_id: None,
-                    status: "Docker image pull failed".into(),
-                    current_bytes: None,
-                    total_bytes: None,
-                    aggregate_current_bytes: None,
-                    aggregate_total_bytes: None,
-                })
-                .await;
-        }
-        cancellations.lock().await.remove(&pull_id);
-        active_resources.lock().await.remove("docker-images");
-    });
+    state
+        .operation_cancellations
+        .lock()
+        .await
+        .insert(request.pull_id, operation_cancel_tx);
+    let operation = new_image_pull_operation(&request);
+    if let Err(error) = state
+        .database
+        .insert_operation_with_request(&operation, &request)
+        .await
+    {
+        state
+            .pull_cancellations
+            .lock()
+            .await
+            .remove(&request.pull_id);
+        state
+            .operation_cancellations
+            .lock()
+            .await
+            .remove(&request.pull_id);
+        state.active_resources.lock().await.remove("docker-images");
+        return Err(ApiFailure::internal(error));
+    }
+    let (response_tx, event_rx) = mpsc::unbounded_channel::<ImagePullProgress>();
+    spawn_image_pull_job(state, request, cancel_rx, Some(response_tx));
 
     let stream = futures_util::stream::unfold(event_rx, |mut receiver| async move {
         receiver.recv().await.map(|event| {
@@ -282,31 +311,307 @@ async fn pull_official_image(
         .map_err(ApiFailure::internal)
 }
 
+fn new_image_pull_operation(request: &PullImageRequest) -> Operation {
+    let now = Utc::now();
+    Operation {
+        id: request.pull_id,
+        kind: OperationKind::PullImage,
+        phase: OperationPhase::Queued,
+        progress_percent: Some(0),
+        cancellable: true,
+        resource_id: None,
+        error: None,
+        result: None,
+        log_lines: vec![
+            "$ webtop-manager image pull".into(),
+            "[controller] queued durable image pull".into(),
+        ],
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn spawn_image_pull_job(
+    state: AppState,
+    request: PullImageRequest,
+    cancellation: watch::Receiver<bool>,
+    response: Option<mpsc::UnboundedSender<ImagePullProgress>>,
+) {
+    tokio::spawn(async move {
+        let pull_id = request.pull_id;
+        let reference = request.reference.clone();
+        let _ = state
+            .database
+            .append_operation_log(pull_id, "[docker] pulling allowlisted image")
+            .await;
+        let _ = state
+            .database
+            .update_operation(pull_id, OperationPhase::Running, Some(5), None, None)
+            .await;
+        let (event_tx, mut event_rx) = mpsc::channel::<ImagePullProgress>(32);
+        let progress_database = state.database.clone();
+        let progress = tokio::spawn(async move {
+            let mut last_percent = 5_u8;
+            while let Some(event) = event_rx.recv().await {
+                if let (Some(current), Some(total)) =
+                    (event.aggregate_current_bytes, event.aggregate_total_bytes)
+                {
+                    if total > 0 {
+                        let percent =
+                            (5_i64 + current.saturating_mul(85) / total).clamp(5, 90) as u8;
+                        if percent >= last_percent.saturating_add(2) {
+                            last_percent = percent;
+                            let _ = progress_database
+                                .update_operation(
+                                    pull_id,
+                                    OperationPhase::Running,
+                                    Some(percent),
+                                    None,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
+                }
+                if let Some(response) = &response {
+                    let _ = response.send(event);
+                }
+            }
+        });
+        let result =
+            docker::pull_official_image(&state.docker, pull_id, &reference, cancellation, event_tx)
+                .await;
+        let _ = progress.await;
+        match result {
+            Ok(docker::ImagePullOutcome::Complete) => {
+                let result = serde_json::json!({"reference":reference});
+                let _ = state
+                    .database
+                    .append_operation_log(pull_id, "[controller] image pull completed")
+                    .await;
+                let _ = state
+                    .database
+                    .update_operation(
+                        pull_id,
+                        OperationPhase::Succeeded,
+                        Some(100),
+                        None,
+                        Some(&result),
+                    )
+                    .await;
+            }
+            Ok(docker::ImagePullOutcome::Cancelled) => {
+                let _ = state
+                    .database
+                    .append_operation_log(pull_id, "[controller] image pull cancelled")
+                    .await;
+                let _ = state
+                    .database
+                    .update_operation(pull_id, OperationPhase::Cancelled, None, None, None)
+                    .await;
+            }
+            Err(error) => {
+                tracing::warn!(%error, %pull_id, %reference, "Docker image pull failed");
+                let api_error = ApiError {
+                    code: ErrorCode::DockerUnavailable,
+                    params: BTreeMap::new(),
+                };
+                let _ = state
+                    .database
+                    .append_operation_log(pull_id, "[controller] image pull failed")
+                    .await;
+                let _ = state
+                    .database
+                    .update_operation(
+                        pull_id,
+                        OperationPhase::Failed,
+                        None,
+                        Some(&api_error),
+                        None,
+                    )
+                    .await;
+            }
+        }
+        state.pull_cancellations.lock().await.remove(&pull_id);
+        state.operation_cancellations.lock().await.remove(&pull_id);
+        state.active_resources.lock().await.remove("docker-images");
+    });
+}
+
+fn reattach_image_pull_stream(database: Database, pull_id: Uuid, reference: String) -> Response {
+    let stream = futures_util::stream::unfold(
+        (database, pull_id, reference, false),
+        |(database, pull_id, reference, finished)| async move {
+            if finished {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let operation = database.get_operation(pull_id).await.ok().flatten();
+            let (phase, status, finished) = match operation.as_ref().map(|value| &value.phase) {
+                Some(OperationPhase::Succeeded) => {
+                    (ImagePullPhase::Complete, "Image pull complete", true)
+                }
+                Some(OperationPhase::Cancelled) => {
+                    (ImagePullPhase::Cancelled, "Image pull cancelled", true)
+                }
+                Some(OperationPhase::Failed | OperationPhase::Retryable) | None => {
+                    (ImagePullPhase::Error, "Image pull failed", true)
+                }
+                _ => (
+                    ImagePullPhase::Progress,
+                    "Image pull running in controller",
+                    false,
+                ),
+            };
+            let event = ImagePullProgress {
+                pull_id,
+                reference: reference.clone(),
+                phase,
+                layer_id: None,
+                status: status.into(),
+                current_bytes: operation
+                    .as_ref()
+                    .and_then(|value| value.progress_percent)
+                    .map(i64::from),
+                total_bytes: Some(100),
+                aggregate_current_bytes: operation
+                    .as_ref()
+                    .and_then(|value| value.progress_percent)
+                    .map(i64::from),
+                aggregate_total_bytes: Some(100),
+            };
+            let mut line = serde_json::to_vec(&event).expect("serialize image pull progress");
+            line.push(b'\n');
+            Some((
+                Ok::<Bytes, Infallible>(Bytes::from(line)),
+                (database, pull_id, reference, finished),
+            ))
+        },
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from_stream(stream))
+        .expect("valid image pull response")
+}
+
+pub async fn resume_interrupted_operations(state: &AppState, operations: Vec<Operation>) {
+    for operation in operations {
+        let request = state
+            .database
+            .get_operation_request::<PullImageRequest>(operation.id)
+            .await;
+        let Ok(Some(request)) = request else {
+            let _ = state
+                .database
+                .update_operation(
+                    operation.id,
+                    OperationPhase::Retryable,
+                    operation.progress_percent,
+                    None,
+                    None,
+                )
+                .await;
+            continue;
+        };
+        let mut resources = state.active_resources.lock().await;
+        if resources.contains("docker-images") {
+            drop(resources);
+            let _ = state
+                .database
+                .update_operation(
+                    operation.id,
+                    OperationPhase::Retryable,
+                    operation.progress_percent,
+                    None,
+                    None,
+                )
+                .await;
+            continue;
+        }
+        resources.insert("docker-images".into());
+        drop(resources);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        state
+            .pull_cancellations
+            .lock()
+            .await
+            .insert(operation.id, cancel_tx.clone());
+        state
+            .operation_cancellations
+            .lock()
+            .await
+            .insert(operation.id, cancel_tx);
+        let _ = state
+            .database
+            .append_operation_log(
+                operation.id,
+                "[controller] reattached interrupted image pull",
+            )
+            .await;
+        spawn_image_pull_job(state.clone(), request, cancel_rx, None);
+    }
+}
+
 async fn cancel_official_image_pull(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> StatusCode {
+) -> Result<StatusCode, ApiFailure> {
+    let operation = state
+        .database
+        .get_operation(id)
+        .await
+        .map_err(ApiFailure::internal)?;
+    if operation.as_ref().is_some_and(|operation| {
+        matches!(
+            operation.phase,
+            OperationPhase::Succeeded
+                | OperationPhase::Failed
+                | OperationPhase::Cancelled
+                | OperationPhase::Retryable
+        )
+    }) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
     if let Some(cancel) = state.pull_cancellations.lock().await.get(&id).cloned() {
         let _ = cancel.send(true);
+        if let Some(operation) = operation {
+            state
+                .database
+                .append_operation_log(id, "[controller] image pull cancellation requested")
+                .await
+                .map_err(ApiFailure::internal)?;
+            state
+                .database
+                .update_operation(
+                    id,
+                    OperationPhase::RollingBack,
+                    operation.progress_percent,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(ApiFailure::internal)?;
+        }
     }
-    StatusCode::NO_CONTENT
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_server_settings(
     State(state): State<AppState>,
 ) -> Result<Json<ServerSettings>, ApiFailure> {
-    ensure_server_token(&state.server_token_path)
+    let token = inspect_server_token(&state)
         .await
         .map_err(ApiFailure::internal)?;
-    let mut settings = state
+    if token.state == ServerTokenState::Missing {
+        suspend_frpc_for_missing_token(&state).await;
+    }
+    let settings = state
         .database
         .get_server_settings()
         .await
         .map_err(ApiFailure::internal)?;
-    settings.token_configured = tokio::fs::try_exists(&state.server_token_path)
-        .await
-        .map_err(ApiFailure::internal)?;
-    Ok(Json(settings))
+    Ok(Json(apply_server_token_state(settings, &token)))
 }
 
 #[derive(Deserialize)]
@@ -330,16 +635,17 @@ async fn update_server_settings(
     State(state): State<AppState>,
     Json(request): Json<UpdateServerSettingsRequest>,
 ) -> Result<Json<ServerSettings>, ApiFailure> {
+    let _guard = state.publication_lock.lock().await;
     let mut settings = request.settings;
     settings.token_configured = false;
     settings
         .validate()
         .map_err(|_| ApiFailure::invalid_request())?;
 
-    ensure_server_token(&state.server_token_path)
+    let token = inspect_server_token(&state)
         .await
         .map_err(ApiFailure::internal)?;
-    settings.token_configured = true;
+    settings = apply_server_token_state(settings, &token);
     state
         .database
         .save_server_settings(&settings)
@@ -348,37 +654,56 @@ async fn update_server_settings(
     Ok(Json(settings))
 }
 
-async fn regenerate_server_token(
+async fn recover_server_token(
     State(state): State<AppState>,
 ) -> Result<Json<ServerSettings>, ApiFailure> {
-    let token = generate_server_token();
-    replace_secret(&state.server_token_path, token.as_bytes())
+    let _guard = state.publication_lock.lock().await;
+    let _token_guard = state.token_lock.lock().await;
+    let current = inspect_or_initialize_server_token(&state.database, &state.server_token_path)
         .await
         .map_err(ApiFailure::internal)?;
-    docker::remove_frpc(&state.docker)
-        .await
-        .map_err(ApiFailure::docker)?;
-    state
-        .database
-        .set_frpc_desired_running(false)
-        .await
-        .map_err(ApiFailure::internal)?;
-    let mut settings = state
+    let recovered = match current.state.clone() {
+        ServerTokenState::Ready => return Err(ApiFailure::invalid_request()),
+        ServerTokenState::RecoveryPending => current,
+        ServerTokenState::Missing => {
+            docker::remove_frpc(&state.docker, &state.frpc_container_name)
+                .await
+                .map_err(ApiFailure::docker)?;
+            state
+                .database
+                .set_frpc_desired_running(false)
+                .await
+                .map_err(ApiFailure::internal)?;
+            let token = generate_server_token().into_bytes();
+            replace_secret(&state.server_token_path, &token)
+                .await
+                .map_err(ApiFailure::internal)?;
+            let fingerprint = token_fingerprint(&token);
+            state
+                .database
+                .save_frp_token_metadata(&fingerprint, true)
+                .await
+                .map_err(ApiFailure::internal)?;
+            ServerTokenMaterial {
+                state: ServerTokenState::RecoveryPending,
+                token: Some(token),
+                fingerprint: Some(fingerprint),
+            }
+        }
+    };
+    let settings = state
         .database
         .get_server_settings()
         .await
         .map_err(ApiFailure::internal)?;
-    settings.token_configured = true;
-    Ok(Json(settings))
+    Ok(Json(apply_server_token_state(settings, &recovered)))
 }
 
 async fn get_frps_setup_guide(
     State(state): State<AppState>,
 ) -> Result<Json<FrpsSetupGuideResponse>, ApiFailure> {
     let settings = required_server_settings(&state).await?;
-    let token = ensure_server_token(&state.server_token_path)
-        .await
-        .map_err(ApiFailure::internal)?;
+    let token = required_server_token(&state, true).await?;
     let token = std::str::from_utf8(&token).map_err(ApiFailure::internal)?;
     Ok(Json(FrpsSetupGuideResponse {
         docker_setup_script: crate::frp::render_frps_docker_setup_script(&settings, token),
@@ -393,23 +718,15 @@ async fn get_frps_setup_guide(
 async fn get_frpc_status(
     State(state): State<AppState>,
 ) -> Result<Json<FrpcServiceStatus>, ApiFailure> {
-    let status = docker::frpc_status(&state.docker)
+    let status = docker::frpc_status(&state.docker, &state.frpc_container_name)
         .await
         .map_err(ApiFailure::docker)?;
     Ok(Json(apply_frpc_desired_state(&state, status).await?))
 }
 
 async fn start_frpc(State(state): State<AppState>) -> Result<Json<FrpcServiceStatus>, ApiFailure> {
-    let settings = required_server_settings(&state).await?;
-    let token = ensure_server_token(&state.server_token_path)
-        .await
-        .map_err(ApiFailure::internal)?;
-    let proxies = current_environment_proxies(&state)
-        .await
-        .map_err(ApiFailure::internal)?;
-    let status = docker::start_frpc(&state.docker, &settings, &token, &proxies)
-        .await
-        .map_err(ApiFailure::docker)?;
+    let _guard = state.publication_lock.lock().await;
+    let status = start_frpc_with_port_retry(&state).await?;
     state
         .database
         .set_frpc_desired_running(true)
@@ -419,7 +736,8 @@ async fn start_frpc(State(state): State<AppState>) -> Result<Json<FrpcServiceSta
 }
 
 async fn stop_frpc(State(state): State<AppState>) -> Result<Json<FrpcServiceStatus>, ApiFailure> {
-    let status = docker::stop_frpc(&state.docker)
+    let _guard = state.publication_lock.lock().await;
+    let status = docker::stop_frpc(&state.docker, &state.frpc_container_name)
         .await
         .map_err(ApiFailure::docker)?;
     state
@@ -433,16 +751,8 @@ async fn stop_frpc(State(state): State<AppState>) -> Result<Json<FrpcServiceStat
 async fn restart_frpc(
     State(state): State<AppState>,
 ) -> Result<Json<FrpcServiceStatus>, ApiFailure> {
-    let settings = required_server_settings(&state).await?;
-    let token = ensure_server_token(&state.server_token_path)
-        .await
-        .map_err(ApiFailure::internal)?;
-    let proxies = current_environment_proxies(&state)
-        .await
-        .map_err(ApiFailure::internal)?;
-    let status = docker::restart_frpc(&state.docker, &settings, &token, &proxies)
-        .await
-        .map_err(ApiFailure::docker)?;
+    let _guard = state.publication_lock.lock().await;
+    let status = start_frpc_with_port_retry(&state).await?;
     state
         .database
         .set_frpc_desired_running(true)
@@ -455,14 +765,28 @@ async fn test_frpc_connectivity(
     State(state): State<AppState>,
 ) -> Result<Json<FrpcTestResult>, ApiFailure> {
     let settings = required_server_settings(&state).await?;
-    let token = ensure_server_token(&state.server_token_path)
+    let material = inspect_server_token(&state)
         .await
         .map_err(ApiFailure::internal)?;
-    Ok(Json(
-        docker::test_frpc_connectivity(&state.docker, &settings, &token)
+    let token = material
+        .token
+        .as_deref()
+        .ok_or_else(ApiFailure::frp_token_recovery_required)?;
+    let result = docker::test_frpc_connectivity(&state.docker, &settings, token)
+        .await
+        .map_err(ApiFailure::docker)?;
+    if result.success && material.state == ServerTokenState::RecoveryPending {
+        let fingerprint = material
+            .fingerprint
+            .as_deref()
+            .ok_or_else(|| ApiFailure::internal("recovery token fingerprint missing"))?;
+        state
+            .database
+            .complete_frp_token_recovery(fingerprint)
             .await
-            .map_err(ApiFailure::docker)?,
-    ))
+            .map_err(ApiFailure::internal)?;
+    }
+    Ok(Json(result))
 }
 
 async fn required_server_settings(state: &AppState) -> Result<ServerSettings, ApiFailure> {
@@ -675,6 +999,7 @@ async fn publish_environment(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<EnvironmentRecord>, ApiFailure> {
+    let _guard = state.publication_lock.lock().await;
     let mut record = required_environment(&state, id).await?;
     if record.spec.publication.enabled && record.spec.publication.remote_port.is_some() {
         return Ok(Json(record));
@@ -703,7 +1028,15 @@ async fn publish_environment(
         .update_environment_spec(id, &record.spec)
         .await
         .map_err(ApiFailure::internal)?;
-    reconcile_frpc_if_desired(&state).await;
+    if state
+        .database
+        .frpc_desired_running()
+        .await
+        .map_err(ApiFailure::internal)?
+    {
+        start_frpc_with_port_retry(&state).await?;
+        record = required_environment(&state, id).await?;
+    }
     Ok(Json(record))
 }
 
@@ -711,6 +1044,7 @@ async fn unpublish_environment(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<EnvironmentRecord>, ApiFailure> {
+    let _guard = state.publication_lock.lock().await;
     let mut record = required_environment(&state, id).await?;
     if !record.spec.publication.enabled {
         return Ok(Json(record));
@@ -723,7 +1057,7 @@ async fn unpublish_environment(
         .update_environment_spec(id, &record.spec)
         .await
         .map_err(ApiFailure::internal)?;
-    reconcile_frpc_if_desired(&state).await;
+    reconcile_frpc_if_desired_locked(&state).await;
     Ok(Json(record))
 }
 
@@ -835,6 +1169,22 @@ fn generate_server_token() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 64)
 }
 
+#[derive(Debug)]
+struct ServerTokenMaterial {
+    state: ServerTokenState,
+    token: Option<Vec<u8>>,
+    fingerprint: Option<String>,
+}
+
+fn apply_server_token_state(
+    mut settings: ServerSettings,
+    material: &ServerTokenMaterial,
+) -> ServerSettings {
+    settings.token_configured = material.token.is_some();
+    settings.token_state = material.state.clone();
+    settings
+}
+
 fn environment_proxies(
     environments: &[EnvironmentRecord],
 ) -> anyhow::Result<Vec<crate::frp::Proxy>> {
@@ -861,6 +1211,83 @@ async fn current_environment_proxies(state: &AppState) -> anyhow::Result<Vec<cra
     let mut environments = state.database.list_environments().await?;
     synchronize_environment_local_ports(state, &mut environments).await?;
     environment_proxies(&environments)
+}
+
+async fn start_frpc_with_port_retry(state: &AppState) -> Result<FrpcServiceStatus, ApiFailure> {
+    let settings = required_server_settings(state).await?;
+    let token = required_server_token(state, false).await?;
+    let mut rejected_ports = BTreeSet::new();
+    loop {
+        let proxies = current_environment_proxies(state)
+            .await
+            .map_err(ApiFailure::internal)?;
+        let status = docker::start_frpc(
+            &state.docker,
+            &state.frpc_container_name,
+            &settings,
+            &token,
+            &proxies,
+        )
+        .await
+        .map_err(ApiFailure::docker)?;
+        let conflicts =
+            docker::frpc_conflicting_proxy_ids(&state.docker, &state.frpc_container_name, &proxies)
+                .await
+                .map_err(ApiFailure::docker)?;
+        if conflicts.is_empty() {
+            return Ok(status);
+        }
+
+        let mut environments = state
+            .database
+            .list_environments()
+            .await
+            .map_err(ApiFailure::internal)?;
+        let mut allocated = environments
+            .iter()
+            .filter_map(|environment| environment.spec.publication.remote_port)
+            .collect::<BTreeSet<_>>();
+        allocated.extend(rejected_ports.iter().copied());
+        for resource_id in conflicts {
+            let id = Uuid::parse_str(&resource_id).map_err(ApiFailure::internal)?;
+            let environment = environments
+                .iter_mut()
+                .find(|environment| environment.id == id)
+                .ok_or_else(ApiFailure::invalid_request)?;
+            let current_port = environment
+                .spec
+                .publication
+                .remote_port
+                .ok_or_else(ApiFailure::invalid_request)?;
+            if !environment.spec.publication.automatic_port {
+                return Err(ApiFailure::port_conflict(ApiError {
+                    code: ErrorCode::PortConflict,
+                    params: BTreeMap::from([("remotePort".into(), current_port.to_string())]),
+                }));
+            }
+            rejected_ports.insert(current_port);
+            allocated.insert(current_port);
+            let replacement = allocate_remote_port(
+                settings.remote_port_start,
+                settings.remote_port_end,
+                &allocated,
+            )
+            .map_err(ApiFailure::port_conflict)?;
+            tracing::warn!(
+                environment_id = %id,
+                rejected_port = current_port,
+                replacement_port = replacement,
+                "retrying FRP proxy after concurrent remote-port conflict"
+            );
+            environment.spec.publication.remote_port = Some(replacement);
+            state
+                .database
+                .update_environment_spec(id, &environment.spec)
+                .await
+                .map_err(ApiFailure::internal)?;
+            allocated.insert(replacement);
+        }
+    }
 }
 
 async fn synchronize_environment_local_ports(
@@ -902,19 +1329,33 @@ async fn synchronize_environment_local_port(
 }
 
 pub async fn reconcile_runtime_state(state: &AppState) {
+    match inspect_server_token(state).await {
+        Ok(material) if material.state == ServerTokenState::Missing => {
+            suspend_frpc_for_missing_token(state).await;
+            return;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to inspect FRP token state");
+            return;
+        }
+    }
     reconcile_frpc_if_desired(state).await;
 }
 
 async fn reconcile_frpc_if_desired(state: &AppState) {
+    let _guard = state.publication_lock.lock().await;
+    reconcile_frpc_if_desired_locked(state).await;
+}
+
+async fn reconcile_frpc_if_desired_locked(state: &AppState) {
     let result = async {
         if !state.database.frpc_desired_running().await? {
             return anyhow::Ok(());
         }
-        let settings = state.database.get_server_settings().await?;
-        settings.validate()?;
-        let token = ensure_server_token(&state.server_token_path).await?;
-        let proxies = current_environment_proxies(state).await?;
-        docker::restart_frpc(&state.docker, &settings, &token, &proxies).await?;
+        start_frpc_with_port_retry(state)
+            .await
+            .map_err(|error| anyhow::anyhow!("FRP reconciliation failed: {:?}", error.1.code))?;
         anyhow::Ok(())
     }
     .await;
@@ -923,20 +1364,124 @@ async fn reconcile_frpc_if_desired(state: &AppState) {
     }
 }
 
-async fn ensure_server_token(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+async fn inspect_or_initialize_server_token(
+    database: &Database,
+    path: &FsPath,
+) -> anyhow::Result<ServerTokenMaterial> {
+    let token = read_server_token(path).await?;
+    let metadata = database.get_frp_token_metadata().await?;
+    if let Some(metadata) = metadata {
+        let Some(token) = token else {
+            return Ok(ServerTokenMaterial {
+                state: ServerTokenState::Missing,
+                token: None,
+                fingerprint: Some(metadata.fingerprint),
+            });
+        };
+        let fingerprint = token_fingerprint(&token);
+        if fingerprint != metadata.fingerprint {
+            return Ok(ServerTokenMaterial {
+                state: ServerTokenState::Missing,
+                token: None,
+                fingerprint: Some(metadata.fingerprint),
+            });
+        }
+        return Ok(ServerTokenMaterial {
+            state: if metadata.recovery_pending {
+                ServerTokenState::RecoveryPending
+            } else {
+                ServerTokenState::Ready
+            },
+            token: Some(token),
+            fingerprint: Some(fingerprint),
+        });
+    }
+
+    if let Some(token) = token {
+        let fingerprint = token_fingerprint(&token);
+        database
+            .save_frp_token_metadata(&fingerprint, false)
+            .await?;
+        return Ok(ServerTokenMaterial {
+            state: ServerTokenState::Ready,
+            token: Some(token),
+            fingerprint: Some(fingerprint),
+        });
+    }
+
+    if database.has_server_settings().await? {
+        return Ok(ServerTokenMaterial {
+            state: ServerTokenState::Missing,
+            token: None,
+            fingerprint: None,
+        });
+    }
+
+    let token = generate_server_token().into_bytes();
+    replace_secret(path, &token).await?;
+    let fingerprint = token_fingerprint(&token);
+    database
+        .save_frp_token_metadata(&fingerprint, false)
+        .await?;
+    Ok(ServerTokenMaterial {
+        state: ServerTokenState::Ready,
+        token: Some(token),
+        fingerprint: Some(fingerprint),
+    })
+}
+
+async fn read_server_token(path: &FsPath) -> std::io::Result<Option<Vec<u8>>> {
     match tokio::fs::read(path).await {
-        Ok(token) if !token.is_empty() => Ok(token),
-        Ok(_) => {
-            let token = generate_server_token().into_bytes();
-            replace_secret(path, &token).await?;
-            Ok(token)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let token = generate_server_token().into_bytes();
-            replace_secret(path, &token).await?;
-            Ok(token)
-        }
+        Ok(token) if !token.is_empty() => Ok(Some(token)),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+fn token_fingerprint(token: &[u8]) -> String {
+    hex::encode(Sha256::digest(token))
+}
+
+async fn required_server_token(
+    state: &AppState,
+    allow_recovery_pending: bool,
+) -> Result<Vec<u8>, ApiFailure> {
+    let material = inspect_server_token(state)
+        .await
+        .map_err(ApiFailure::internal)?;
+    let usable = material.state == ServerTokenState::Ready
+        || (allow_recovery_pending && material.state == ServerTokenState::RecoveryPending);
+    if !usable {
+        return Err(ApiFailure::frp_token_recovery_required());
+    }
+    material
+        .token
+        .ok_or_else(ApiFailure::frp_token_recovery_required)
+}
+
+async fn inspect_server_token(state: &AppState) -> anyhow::Result<ServerTokenMaterial> {
+    let _guard = state.token_lock.lock().await;
+    inspect_or_initialize_server_token(&state.database, &state.server_token_path).await
+}
+
+async fn suspend_frpc_for_missing_token(state: &AppState) {
+    let desired_running = match state.database.frpc_desired_running().await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to read frpc desired state after token loss");
+            return;
+        }
+    };
+    if !desired_running {
+        return;
+    }
+    let _guard = state.publication_lock.lock().await;
+    if let Err(error) = docker::remove_frpc(&state.docker, &state.frpc_container_name).await {
+        tracing::warn!(error = %error, "failed to remove frpc after token loss");
+    }
+    if let Err(error) = state.database.set_frpc_desired_running(false).await {
+        tracing::warn!(error = %error, "failed to suspend frpc desired state after token loss");
     }
 }
 
@@ -1002,6 +1547,16 @@ impl ApiFailure {
         )
     }
 
+    fn frp_token_recovery_required() -> Self {
+        Self(
+            StatusCode::CONFLICT,
+            ApiError {
+                code: ErrorCode::FrpTokenRecoveryRequired,
+                params: BTreeMap::new(),
+            },
+        )
+    }
+
     fn port_conflict(error: ApiError) -> Self {
         Self(StatusCode::CONFLICT, error)
     }
@@ -1021,5 +1576,98 @@ impl ApiFailure {
 impl axum::response::IntoResponse for ApiFailure {
     fn into_response(self) -> axum::response::Response {
         (self.0, Json(self.1)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn first_use_generates_once_and_registers_a_fingerprint() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(&directory.path().join("controller.sqlite3"))
+            .await
+            .unwrap();
+        let token_path = directory.path().join("frp-token");
+
+        let first = inspect_or_initialize_server_token(&database, &token_path)
+            .await
+            .unwrap();
+        let second = inspect_or_initialize_server_token(&database, &token_path)
+            .await
+            .unwrap();
+
+        assert_eq!(first.state, ServerTokenState::Ready);
+        assert_eq!(first.token, second.token);
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(
+            database
+                .get_frp_token_metadata()
+                .await
+                .unwrap()
+                .unwrap()
+                .fingerprint,
+            first.fingerprint.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_paired_token_is_not_silently_replaced() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(&directory.path().join("controller.sqlite3"))
+            .await
+            .unwrap();
+        let token_path = directory.path().join("frp-token");
+        let original = inspect_or_initialize_server_token(&database, &token_path)
+            .await
+            .unwrap();
+        database
+            .save_server_settings(&ServerSettings::default())
+            .await
+            .unwrap();
+        tokio::fs::remove_file(&token_path).await.unwrap();
+
+        let missing = inspect_or_initialize_server_token(&database, &token_path)
+            .await
+            .unwrap();
+
+        assert_eq!(missing.state, ServerTokenState::Missing);
+        assert!(missing.token.is_none());
+        assert!(!tokio::fs::try_exists(&token_path).await.unwrap());
+        assert_eq!(missing.fingerprint, original.fingerprint);
+    }
+
+    #[tokio::test]
+    async fn an_existing_legacy_token_is_adopted_without_rotation() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(&directory.path().join("controller.sqlite3"))
+            .await
+            .unwrap();
+        let token_path = directory.path().join("frp-token");
+        tokio::fs::write(&token_path, b"legacy-managed-token")
+            .await
+            .unwrap();
+
+        let adopted = inspect_or_initialize_server_token(&database, &token_path)
+            .await
+            .unwrap();
+
+        assert_eq!(adopted.state, ServerTokenState::Ready);
+        assert_eq!(
+            adopted.token.as_deref(),
+            Some(b"legacy-managed-token".as_slice())
+        );
+        assert_eq!(
+            database
+                .get_frp_token_metadata()
+                .await
+                .unwrap()
+                .unwrap()
+                .fingerprint,
+            token_fingerprint(b"legacy-managed-token")
+        );
     }
 }

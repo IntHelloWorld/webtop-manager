@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 use std::os::unix::fs::MetadataExt;
 
@@ -24,8 +24,6 @@ use webtop_contracts::{
     OfficialImage, SeccompMode, ServerSettings, OWNER_LABEL, RESOURCE_ID_LABEL,
     RESOURCE_KIND_LABEL, WEBTOP_HTTPS_PORT,
 };
-
-const FRPC_CONTAINER_NAME: &str = "webtop-manager-frpc";
 
 struct OfficialImageDefinition {
     tag: &'static str,
@@ -424,7 +422,11 @@ async fn send_pull_event(
     events: &mpsc::Sender<ImagePullProgress>,
     event: ImagePullProgress,
 ) -> bool {
-    events.send(event).await.is_ok()
+    // Progress subscribers are allowed to disconnect without cancelling the
+    // controller-owned pull. Cancellation is explicit through the watch
+    // channel so the job can survive a closed desktop or HTTP stream.
+    let _ = events.send(event).await;
+    true
 }
 
 pub struct CreatedContainer {
@@ -696,17 +698,17 @@ async fn ensure_image(docker: &Docker, image: &str) -> Result<()> {
 
 pub async fn start_frpc(
     docker: &Docker,
+    container_name: &str,
     settings: &ServerSettings,
     token: &[u8],
     proxies: &[crate::frp::Proxy],
 ) -> Result<FrpcServiceStatus> {
     ensure_image(docker, &settings.frpc_image).await?;
-    remove_frpc(docker).await?;
+    remove_frpc(docker, container_name).await?;
     create_frpc_container(
         docker,
-        FRPC_CONTAINER_NAME,
-        "frpc",
-        "shared",
+        container_name,
+        ("frpc", "shared"),
         settings,
         token,
         proxies,
@@ -714,43 +716,37 @@ pub async fn start_frpc(
     )
     .await?;
     docker
-        .start_container(FRPC_CONTAINER_NAME, None)
+        .start_container(container_name, None)
         .await
         .context("start shared frpc container")?;
     sleep(Duration::from_millis(350)).await;
-    frpc_status(docker).await
+    frpc_status(docker, container_name).await
 }
 
-pub async fn restart_frpc(
-    docker: &Docker,
-    settings: &ServerSettings,
-    token: &[u8],
-    proxies: &[crate::frp::Proxy],
-) -> Result<FrpcServiceStatus> {
-    start_frpc(docker, settings, token, proxies).await
-}
-
-pub async fn stop_frpc(docker: &Docker) -> Result<FrpcServiceStatus> {
-    let Some(inspect) = inspect_managed_frpc(docker).await? else {
+pub async fn stop_frpc(docker: &Docker, container_name: &str) -> Result<FrpcServiceStatus> {
+    let Some(inspect) = inspect_managed_frpc(docker, container_name).await? else {
         return Ok(not_created_frpc_status());
     };
     if inspect.state.as_ref().and_then(|state| state.running) == Some(true) {
         docker
             .stop_container(
-                FRPC_CONTAINER_NAME,
+                container_name,
                 Some(StopContainerOptionsBuilder::default().t(10).build()),
             )
             .await
             .context("stop shared frpc container")?;
     }
-    frpc_status(docker).await
+    frpc_status(docker, container_name).await
 }
 
-pub async fn remove_frpc(docker: &Docker) -> Result<()> {
-    if inspect_managed_frpc(docker).await?.is_some() {
+pub async fn remove_frpc(docker: &Docker, container_name: &str) -> Result<()> {
+    if inspect_managed_frpc(docker, container_name)
+        .await?
+        .is_some()
+    {
         docker
             .remove_container(
-                FRPC_CONTAINER_NAME,
+                container_name,
                 Some(RemoveContainerOptionsBuilder::default().force(true).build()),
             )
             .await
@@ -759,13 +755,13 @@ pub async fn remove_frpc(docker: &Docker) -> Result<()> {
     Ok(())
 }
 
-pub async fn frpc_status(docker: &Docker) -> Result<FrpcServiceStatus> {
-    let Some(inspect) = inspect_managed_frpc(docker).await? else {
+pub async fn frpc_status(docker: &Docker, container_name: &str) -> Result<FrpcServiceStatus> {
+    let Some(inspect) = inspect_managed_frpc(docker, container_name).await? else {
         return Ok(not_created_frpc_status());
     };
     let state = inspect.state.unwrap_or_default();
     let running = state.running == Some(true);
-    let logs = recent_logs(docker, FRPC_CONTAINER_NAME)
+    let logs = recent_logs(docker, container_name)
         .await
         .unwrap_or_default();
     let connected = running && logs.contains("login to server success");
@@ -785,6 +781,56 @@ pub async fn frpc_status(docker: &Docker) -> Result<FrpcServiceStatus> {
     })
 }
 
+pub async fn frpc_conflicting_proxy_ids(
+    docker: &Docker,
+    container_name: &str,
+    proxies: &[crate::frp::Proxy],
+) -> Result<BTreeSet<String>> {
+    if proxies.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    for _ in 0..20 {
+        let logs = recent_logs(docker, container_name).await?;
+        let (conflicts, settled) = classify_proxy_registrations(&logs, proxies);
+        if !conflicts.is_empty() || settled == proxies.len() {
+            return Ok(conflicts);
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    Ok(BTreeSet::new())
+}
+
+fn classify_proxy_registrations(
+    logs: &str,
+    proxies: &[crate::frp::Proxy],
+) -> (BTreeSet<String>, usize) {
+    let mut conflicts = BTreeSet::new();
+    let mut settled = BTreeSet::new();
+    for line in logs.lines() {
+        let lower = line.to_ascii_lowercase();
+        let is_conflict = lower.contains("port already used")
+            || lower.contains("port is already used")
+            || lower.contains("remote port is used")
+            || lower.contains("proxy name") && lower.contains("already in use");
+        let is_success = lower.contains("start proxy success")
+            || lower.contains("proxy added")
+            || lower.contains("start proxy") && lower.contains("success");
+        if !is_conflict && !is_success {
+            continue;
+        }
+        for proxy in proxies {
+            let proxy_name = format!("webtop-{}", proxy.resource_id);
+            if line.contains(&proxy_name) {
+                settled.insert(proxy.resource_id.clone());
+                if is_conflict {
+                    conflicts.insert(proxy.resource_id.clone());
+                }
+            }
+        }
+    }
+    (conflicts, settled.len())
+}
+
 pub async fn test_frpc_connectivity(
     docker: &Docker,
     settings: &ServerSettings,
@@ -793,11 +839,11 @@ pub async fn test_frpc_connectivity(
     ensure_image(docker, &settings.frpc_image).await?;
     let test_id = Uuid::new_v4();
     let container_name = format!("webtop-manager-frpc-test-{test_id}");
+    let test_resource_id = test_id.to_string();
     create_frpc_container(
         docker,
         &container_name,
-        "frpc-test",
-        &test_id.to_string(),
+        ("frpc-test", &test_resource_id),
         settings,
         token,
         &[],
@@ -845,13 +891,13 @@ pub async fn test_frpc_connectivity(
 async fn create_frpc_container(
     docker: &Docker,
     container_name: &str,
-    resource_kind: &str,
-    resource_id: &str,
+    ownership: (&str, &str),
     settings: &ServerSettings,
     token: &[u8],
     proxies: &[crate::frp::Proxy],
     persistent: bool,
 ) -> Result<()> {
+    let (resource_kind, resource_id) = ownership;
     let labels = HashMap::from([
         (OWNER_LABEL.into(), "managed".into()),
         (RESOURCE_ID_LABEL.into(), resource_id.into()),
@@ -945,8 +991,9 @@ fn append_archive_file(
 
 async fn inspect_managed_frpc(
     docker: &Docker,
+    container_name: &str,
 ) -> Result<Option<bollard::models::ContainerInspectResponse>> {
-    match docker.inspect_container(FRPC_CONTAINER_NAME, None).await {
+    match docker.inspect_container(container_name, None).await {
         Ok(inspect) => {
             let labels = inspect
                 .config
@@ -1107,5 +1154,30 @@ mod tests {
 
         assert_eq!(host_port_from_bindings(&ports, "3001/tcp"), Some(32774));
         assert_eq!(host_port_from_bindings(&ports, "3000/tcp"), None);
+    }
+
+    #[test]
+    fn identifies_the_proxy_that_lost_a_remote_port_race() {
+        let proxies = vec![
+            crate::frp::Proxy {
+                resource_id: "environment-a".into(),
+                local_port: 32770,
+                remote_port: 43000,
+            },
+            crate::frp::Proxy {
+                resource_id: "environment-b".into(),
+                local_port: 32771,
+                remote_port: 43001,
+            },
+        ];
+        let logs = r#"
+[I] [webtop-environment-a] start proxy success
+[W] [webtop-environment-b] start error: port already used
+"#;
+
+        let (conflicts, settled) = classify_proxy_registrations(logs, &proxies);
+
+        assert_eq!(conflicts, BTreeSet::from(["environment-b".into()]));
+        assert_eq!(settled, 2);
     }
 }

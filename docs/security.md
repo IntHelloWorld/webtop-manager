@@ -1,5 +1,7 @@
 # Security model
 
+[简体中文](security.zh-CN.md)
+
 Docker Socket access is root-equivalent. The controller is therefore treated
 as a privileged local service even though its container uses a read-only root
 filesystem, no published ports, `no-new-privileges`, no Linux capabilities and
@@ -21,6 +23,10 @@ a minimal set of bind mounts.
   setup guide, while `/v1/environments/{id}/credentials` reads the protected
   Webtop password only for an environment currently published to the Internet.
   The environment card masks that password by default.
+- The FRP token is generated once and tracked in SQLite only by SHA-256
+  fingerprint. A missing or replaced secret suspends automatic frpc startup;
+  the recovery endpoint is rejected while the original token is healthy and a
+  recovery credential becomes active only after an authenticated test succeeds.
 - Application data deletion requires exact-name confirmation and a canonical path strictly below the environment root.
 - User-supplied external mounts are never deleted automatically.
 - Environment data-directory opening accepts only the managed `/config` mount

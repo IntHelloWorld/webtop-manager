@@ -1,5 +1,7 @@
 # Remote frps setup
 
+[简体中文](frps-setup.zh-CN.md)
+
 Webtop Manager generates an isolated frps deployment for two remote Linux
 server scenarios. Save the server address, public address, and frpc image in
 **Server settings**, then select **Open frps setup guide**. In the guide, choose
@@ -7,7 +9,9 @@ the frps `bindPort` and remote port range, then select **Generate commands**.
 The selected ports are saved back to the client settings before the commands
 are requested, so frpc and frps use the same values. Editing a port afterward
 hides the old commands until they are generated again. Neither deployment path
-reads, edits, stops, or restarts an existing frps service.
+reads, edits, stops, or restarts an unrelated existing frps service. Re-running
+a command updates and restarts only the dedicated instance previously created
+and marked as managed by Webtop Manager.
 
 ## New server with Docker
 
@@ -31,7 +35,8 @@ pinned frp release archive, verifies its SHA-256 checksum, installs `frps` under
 system user. Configuration and the mode-`0600` token file live under
 `/etc/webtop-manager-frps`; the dedicated `webtop-manager-frps.service` systemd
 unit starts the service and enables it at boot. The script validates the
-configuration with `frps verify` before starting the service. It refuses to
+configuration with `frps verify`, enables the unit, and explicitly restarts it
+so a repaired token is active immediately. It refuses to
 overwrite a same-named unit or configuration directory that lacks the Webtop
 Manager marker.
 
@@ -50,6 +55,21 @@ Webtop Manager service will fail to start or publish until its ports are changed
 Generated installation and token commands contain the authentication token.
 Run them only in a trusted server terminal and do not save them in tickets,
 chat messages, shell scripts committed to source control, or public logs.
+
+## Token persistence and recovery
+
+The app generates the token once and keeps it under its per-user application
+data directory. Normal upgrades, package removal and reinstallation do not
+delete that data, so they reuse the existing token. There is no routine token
+rotation control.
+
+The controller stores only a SHA-256 fingerprint in SQLite. If the protected
+token file is deleted, replaced, or emptied, it does not silently generate a
+new token or start frpc. Server settings instead expose a recovery flow. That
+flow creates one stable replacement credential, keeps reusing it across
+retries, and asks the user to rerun the managed frps command. A successful
+authenticated connectivity test completes recovery. If the original token was
+backed up, restoring that exact mode-`0600` file avoids remote reconfiguration.
 
 ## Firewall rules
 

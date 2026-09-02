@@ -2,11 +2,10 @@ use std::{path::Path, time::Duration};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{ConnectOptions, Row, SqlitePool};
 use uuid::Uuid;
-#[cfg(test)]
 use webtop_contracts::OperationKind;
 use webtop_contracts::{
     ApiError, EnvironmentSpec, Operation, OperationPhase, ServerSettings, Template,
@@ -15,6 +14,14 @@ use webtop_contracts::{
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+}
+
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrpTokenMetadata {
+    pub fingerprint: String,
+    pub recovery_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +52,13 @@ impl Database {
             .connect_with(options)
             .await
             .context("open controller database")?;
+        let schema_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&pool)
+            .await?;
+        anyhow::ensure!(
+            schema_version <= CURRENT_SCHEMA_VERSION,
+            "controller database schema {schema_version} is newer than supported schema {CURRENT_SCHEMA_VERSION}"
+        );
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS environments (
@@ -88,6 +102,7 @@ impl Database {
             "TEXT NOT NULL DEFAULT '[]'",
         )
         .await?;
+        ensure_column(&pool, "operations", "request_json", "TEXT").await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS templates (
@@ -125,6 +140,21 @@ impl Database {
         )
         .execute(&pool)
         .await?;
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS frp_token_metadata (
+              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+              fingerprint TEXT NOT NULL,
+              recovery_pending INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(&format!("PRAGMA user_version = {CURRENT_SCHEMA_VERSION}"))
+            .execute(&pool)
+            .await?;
         Ok(Self { pool })
     }
 
@@ -152,6 +182,61 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn has_server_settings(&self) -> Result<bool> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM server_settings WHERE singleton = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(count != 0)
+    }
+
+    pub async fn get_frp_token_metadata(&self) -> Result<Option<FrpTokenMetadata>> {
+        let row = sqlx::query(
+            "SELECT fingerprint, recovery_pending FROM frp_token_metadata WHERE singleton = 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| FrpTokenMetadata {
+            fingerprint: row.get("fingerprint"),
+            recovery_pending: row.get("recovery_pending"),
+        }))
+    }
+
+    pub async fn save_frp_token_metadata(
+        &self,
+        fingerprint: &str,
+        recovery_pending: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO frp_token_metadata
+               (singleton, fingerprint, recovery_pending, updated_at)
+               VALUES (1, ?, ?, ?)
+               ON CONFLICT(singleton) DO UPDATE SET
+                 fingerprint = excluded.fingerprint,
+                 recovery_pending = excluded.recovery_pending,
+                 updated_at = excluded.updated_at"#,
+        )
+        .bind(fingerprint)
+        .bind(recovery_pending)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn complete_frp_token_recovery(&self, fingerprint: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"UPDATE frp_token_metadata
+               SET recovery_pending = 0, updated_at = ?
+               WHERE singleton = 1 AND fingerprint = ? AND recovery_pending = 1"#,
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(fingerprint)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn frpc_desired_running(&self) -> Result<bool> {
@@ -344,11 +429,28 @@ impl Database {
     }
 
     pub async fn insert_operation(&self, operation: &Operation) -> Result<()> {
+        self.insert_operation_json(operation, None).await
+    }
+
+    pub async fn insert_operation_with_request<T: Serialize>(
+        &self,
+        operation: &Operation,
+        request: &T,
+    ) -> Result<()> {
+        self.insert_operation_json(operation, Some(serde_json::to_string(request)?))
+            .await
+    }
+
+    async fn insert_operation_json(
+        &self,
+        operation: &Operation,
+        request_json: Option<String>,
+    ) -> Result<()> {
         sqlx::query(
             r#"INSERT INTO operations
                (id, kind, phase, progress_percent, cancellable, resource_id, error_code,
-                error_params_json, result_json, log_json, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                error_params_json, result_json, log_json, request_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(operation.id.to_string())
         .bind(serde_json::to_string(&operation.kind)?)
@@ -378,6 +480,7 @@ impl Database {
                 .transpose()?,
         )
         .bind(serde_json::to_string(&operation.log_lines)?)
+        .bind(request_json)
         .bind(operation.created_at.to_rfc3339())
         .bind(operation.updated_at.to_rfc3339())
         .execute(&self.pool)
@@ -403,6 +506,18 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn get_operation_request<T: DeserializeOwned>(&self, id: Uuid) -> Result<Option<T>> {
+        let value: Option<String> =
+            sqlx::query_scalar("SELECT request_json FROM operations WHERE id = ?")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        value
+            .map(|json| serde_json::from_str(&json).context("parse operation request"))
+            .transpose()
     }
 
     pub async fn update_operation(
@@ -465,19 +580,37 @@ impl Database {
             .collect()
     }
 
-    pub async fn recover_unfinished_operations(&self) -> Result<usize> {
+    pub async fn recover_unfinished_operations(&self) -> Result<Vec<Operation>> {
         let unfinished = self.list_unfinished_operations().await?;
+        let mut resumable = Vec::new();
         for operation in &unfinished {
-            self.update_operation(
-                operation.id,
-                OperationPhase::Retryable,
-                operation.progress_percent,
-                None,
-                None,
-            )
-            .await?;
+            if operation.kind == OperationKind::PullImage
+                && self
+                    .get_operation_request::<serde_json::Value>(operation.id)
+                    .await?
+                    .is_some()
+            {
+                self.update_operation(
+                    operation.id,
+                    OperationPhase::Queued,
+                    operation.progress_percent,
+                    None,
+                    None,
+                )
+                .await?;
+                resumable.push(operation.clone());
+            } else {
+                self.update_operation(
+                    operation.id,
+                    OperationPhase::Retryable,
+                    operation.progress_percent,
+                    None,
+                    None,
+                )
+                .await?;
+            }
         }
-        Ok(unfinished.len())
+        Ok(resumable)
     }
 }
 
@@ -585,6 +718,39 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn tracks_token_fingerprint_without_persisting_the_secret() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(&directory.path().join("controller.sqlite3"))
+            .await
+            .unwrap();
+
+        assert_eq!(database.get_frp_token_metadata().await.unwrap(), None);
+        database
+            .save_frp_token_metadata("fingerprint-only", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            database.get_frp_token_metadata().await.unwrap(),
+            Some(FrpTokenMetadata {
+                fingerprint: "fingerprint-only".into(),
+                recovery_pending: true,
+            })
+        );
+        assert!(database
+            .complete_frp_token_recovery("fingerprint-only")
+            .await
+            .unwrap());
+        assert!(
+            !database
+                .get_frp_token_metadata()
+                .await
+                .unwrap()
+                .unwrap()
+                .recovery_pending
+        );
+    }
+
+    #[tokio::test]
     async fn updates_an_environment_local_port_after_docker_reassigns_it() {
         let directory = tempdir().unwrap();
         let database = Database::open(&directory.path().join("controller.sqlite3"))
@@ -641,7 +807,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(database.recover_unfinished_operations().await.unwrap(), 1);
+        assert!(database
+            .recover_unfinished_operations()
+            .await
+            .unwrap()
+            .is_empty());
         let recovered = database.get_operation(operation.id).await.unwrap().unwrap();
         assert_eq!(recovered.phase, OperationPhase::Retryable);
         assert_eq!(recovered.progress_percent, Some(45));
@@ -652,6 +822,74 @@ mod tests {
                 "[worker] snapshot complete".to_string()
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn interrupted_image_pulls_keep_their_request_for_reattachment() {
+        let directory = tempdir().unwrap();
+        let database = Database::open(&directory.path().join("controller.sqlite3"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let operation = Operation {
+            id: Uuid::new_v4(),
+            kind: OperationKind::PullImage,
+            phase: OperationPhase::Running,
+            progress_percent: Some(30),
+            cancellable: true,
+            resource_id: None,
+            error: None,
+            result: None,
+            log_lines: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        let request = serde_json::json!({
+            "pullId": operation.id,
+            "reference": "lscr.io/linuxserver/webtop:latest"
+        });
+        database
+            .insert_operation_with_request(&operation, &request)
+            .await
+            .unwrap();
+
+        let resumable = database.recover_unfinished_operations().await.unwrap();
+
+        assert_eq!(resumable, vec![operation.clone()]);
+        assert_eq!(
+            database
+                .get_operation(operation.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .phase,
+            OperationPhase::Queued
+        );
+        assert_eq!(
+            database
+                .get_operation_request::<serde_json::Value>(operation.id)
+                .await
+                .unwrap(),
+            Some(request)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_a_database_from_a_newer_controller() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("controller.sqlite3");
+        let database = Database::open(&path).await.unwrap();
+        sqlx::query("PRAGMA user_version = 999")
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.pool.close().await;
+
+        let error = match Database::open(&path).await {
+            Ok(_) => panic!("newer database schema should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("newer than supported"));
     }
 
     #[tokio::test]

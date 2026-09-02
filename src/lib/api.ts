@@ -165,8 +165,8 @@ export function saveServerSettings(
   });
 }
 
-export function regenerateServerToken(): Promise<ServerSettings> {
-  return invoke("regenerate_server_token");
+export function recoverServerToken(): Promise<ServerSettings> {
+  return invoke("recover_server_token");
 }
 
 export function getFrpsSetupGuide(): Promise<FrpsSetupGuide> {

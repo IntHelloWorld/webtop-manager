@@ -21,6 +21,7 @@ const savedSettings = {
   remotePortStart: 41000,
   remotePortEnd: 42000,
   tokenConfigured: true,
+  tokenState: "ready",
   frpcImage: "ghcr.io/fatedier/frpc:v0.70.1",
 };
 

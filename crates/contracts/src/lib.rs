@@ -290,7 +290,18 @@ pub struct ServerSettings {
     pub remote_port_start: u16,
     pub remote_port_end: u16,
     pub token_configured: bool,
+    #[serde(default)]
+    pub token_state: ServerTokenState,
     pub frpc_image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ServerTokenState {
+    Ready,
+    #[default]
+    Missing,
+    RecoveryPending,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -340,6 +351,7 @@ impl Default for ServerSettings {
             remote_port_start: 41000,
             remote_port_end: 42000,
             token_configured: false,
+            token_state: ServerTokenState::Missing,
             frpc_image: DEFAULT_FRPC_IMAGE.into(),
         }
     }
@@ -617,6 +629,7 @@ pub enum ErrorCode {
     TemplatePackageInvalid,
     TemplateNameConflict,
     OperationNotCancellable,
+    FrpTokenRecoveryRequired,
     Internal,
 }
 

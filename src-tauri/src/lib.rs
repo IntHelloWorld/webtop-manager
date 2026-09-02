@@ -679,11 +679,11 @@ async fn save_server_settings(
 }
 
 #[tauri::command]
-async fn regenerate_server_token(app: AppHandle) -> Result<Value, ApiError> {
+async fn recover_server_token(app: AppHandle) -> Result<Value, ApiError> {
     let response = request::<Value>(
         &app,
         "POST",
-        "/v1/settings/server/token/regenerate",
+        "/v1/settings/server/token/recover",
         Option::<Value>::None,
     )
     .await?;
@@ -1035,7 +1035,7 @@ pub fn run() {
             prune_image_cache,
             get_server_settings,
             save_server_settings,
-            regenerate_server_token,
+            recover_server_token,
             get_frps_setup_guide,
             get_frpc_status,
             frpc_action,

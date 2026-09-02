@@ -228,7 +228,8 @@ FRPS_SERVICE
 
 sudo -u "$SERVICE_USER" "$INSTALL_DIR/bin/frps" verify -c "$CONFIG_DIR/frps.toml"
 sudo systemctl daemon-reload
-sudo systemctl enable --now "$SERVICE_NAME"
+sudo systemctl enable "$SERVICE_NAME"
+sudo systemctl restart "$SERVICE_NAME"
 sudo systemctl --no-pager --full status "$SERVICE_NAME"
 "#,
         version = FRP_VERSION,
@@ -242,6 +243,8 @@ sudo systemctl --no-pager --full status "$SERVICE_NAME"
 
 #[cfg(test)]
 mod tests {
+    use webtop_contracts::ServerTokenState;
+
     use super::*;
 
     #[test]
@@ -253,6 +256,7 @@ mod tests {
             remote_port_start: 41000,
             remote_port_end: 42000,
             token_configured: true,
+            token_state: ServerTokenState::Ready,
             frpc_image: "ghcr.io/fatedier/frpc:v0.70.1".into(),
         };
         let config = render(
@@ -278,6 +282,7 @@ mod tests {
             remote_port_start: 41000,
             remote_port_end: 42000,
             token_configured: true,
+            token_state: ServerTokenState::Ready,
             frpc_image: "ghcr.io/fatedier/frpc:v0.70.1".into(),
         };
         assert!(render_connectivity_test(&settings).contains("loginFailExit = true"));
@@ -292,6 +297,7 @@ mod tests {
             remote_port_start: 41000,
             remote_port_end: 42000,
             token_configured: true,
+            token_state: ServerTokenState::Ready,
             frpc_image: "ghcr.io/fatedier/frpc:v0.70.1".into(),
         };
         let script = render_frps_docker_setup_script(&settings, "generated-token");
@@ -310,6 +316,7 @@ mod tests {
             remote_port_start: 41000,
             remote_port_end: 42000,
             token_configured: true,
+            token_state: ServerTokenState::Ready,
             frpc_image: "ghcr.io/fatedier/frpc:v0.70.1".into(),
         };
         let script = render_frps_native_setup_script(&settings, "generated-token");
@@ -322,6 +329,7 @@ mod tests {
         assert!(!script.contains("/etc/systemd/system/frps.service"));
         assert!(!script.contains("/usr/local/bin/frps"));
         assert!(script.contains("generated-token"));
+        assert!(script.contains("systemctl restart \"$SERVICE_NAME\""));
     }
 
     #[test]
@@ -333,6 +341,7 @@ mod tests {
             remote_port_start: 41000,
             remote_port_end: 42000,
             token_configured: true,
+            token_state: ServerTokenState::Ready,
             frpc_image: "ghcr.io/fatedier/frpc:v0.70.1".into(),
         };
         let script = render_frps_docker_setup_script(&settings, "generated-token");

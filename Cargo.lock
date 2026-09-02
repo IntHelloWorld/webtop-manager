@@ -5061,7 +5061,7 @@ dependencies = [
 
 [[package]]
 name = "webtop-contracts"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "serde",
@@ -5072,7 +5072,7 @@ dependencies = [
 
 [[package]]
 name = "webtop-controller"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5100,7 +5100,7 @@ dependencies = [
 
 [[package]]
 name = "webtop-manager"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "bollard",
@@ -5127,7 +5127,7 @@ dependencies = [
 
 [[package]]
 name = "webtop-worker"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "hex",

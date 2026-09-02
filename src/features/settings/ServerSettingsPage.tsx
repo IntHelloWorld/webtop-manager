@@ -8,7 +8,7 @@ import { HelpTip } from "../../components/HelpTip";
 import {
   getFrpcStatus,
   getServerSettings,
-  regenerateServerToken,
+  recoverServerToken,
   runFrpcAction,
   saveServerSettings,
   testFrpcConnectivity,
@@ -70,14 +70,20 @@ export function ServerSettingsPage() {
     onSuccess: (status) => queryClient.setQueryData(["frpc-status"], status),
   });
 
-  const connectivity = useMutation({ mutationFn: testFrpcConnectivity });
+  const connectivity = useMutation({
+    mutationFn: testFrpcConnectivity,
+    onSuccess: (result) => {
+      if (result.success) void queryClient.invalidateQueries({ queryKey: ["server-settings"] });
+    },
+  });
 
-  const regenerate = useMutation({
-    mutationFn: regenerateServerToken,
+  const recovery = useMutation({
+    mutationFn: recoverServerToken,
     onSuccess: (saved) => {
       queryClient.setQueryData(["server-settings"], saved);
       queryClient.removeQueries({ queryKey: ["frps-setup-guide"] });
       void queryClient.invalidateQueries({ queryKey: ["frpc-status"] });
+      setShowGuide(true);
     },
   });
 
@@ -89,12 +95,16 @@ export function ServerSettingsPage() {
       remotePortStart: values.remotePortStart,
       remotePortEnd: values.remotePortEnd,
       tokenConfigured: settings.data?.tokenConfigured ?? false,
+      tokenState: settings.data?.tokenState ?? "missing",
       frpcImage: values.frpcImage,
     };
     save.mutate(next);
   };
 
   const configured = Boolean(settings.data?.frpsHost && settings.data.publicIp);
+  const tokenState = settings.data?.tokenState;
+  const tokenReady = tokenState === "ready";
+  const tokenAvailable = tokenReady || tokenState === "recovery_pending";
   const actionsDisabled = isDirty || !configured || serviceAction.isPending || connectivity.isPending;
 
   if (showGuide) return <FrpsSetupGuide onClose={() => setShowGuide(false)} />;
@@ -104,7 +114,22 @@ export function ServerSettingsPage() {
       <header className="page-header">
         <div><p className="eyebrow">FRP SERVER</p><h2 id="settings-title">{t("settings.title")}</h2><p>{t("settings.description")}</p></div>
       </header>
-      <div className="security-banner"><span aria-hidden="true">◇</span><div><strong>{t("settings.secretTitle")}</strong><p>{t("settings.secretHint")}</p></div><button type="button" className="secondary-button" disabled={regenerate.isPending} onClick={() => { if (window.confirm(t("settings.regenerateConfirm"))) regenerate.mutate(); }}>{t(regenerate.isPending ? "settings.regenerating" : "settings.regenerate")}</button></div>
+      {tokenState === "missing" ? (
+        <div className="security-banner warning-banner settings-width" role="alert">
+          <span aria-hidden="true">!</span>
+          <div><strong>{t("settings.recovery.missingTitle")}</strong><p>{t("settings.recovery.missingHint")}</p></div>
+          <button type="button" className="secondary-button" disabled={isDirty || recovery.isPending} onClick={() => recovery.mutate()}>{t(recovery.isPending ? "settings.recovery.starting" : "settings.recovery.start")}</button>
+        </div>
+      ) : tokenState === "recovery_pending" ? (
+        <div className="security-banner warning-banner settings-width" role="status">
+          <span aria-hidden="true">!</span>
+          <div><strong>{t("settings.recovery.pendingTitle")}</strong><p>{t("settings.recovery.pendingHint")}</p></div>
+          <button type="button" className="secondary-button" disabled={isDirty} onClick={() => setShowGuide(true)}>{t("settings.recovery.openGuide")}</button>
+        </div>
+      ) : (
+        <div className="security-banner settings-width"><span aria-hidden="true">◇</span><div><strong>{t("settings.secretTitle")}</strong><p>{t("settings.secretHint")}</p></div></div>
+      )}
+      {recovery.isError ? <div className="inline-error" role="alert">{t("settings.recovery.failed")}</div> : null}
       {settings.isLoading ? <p className="muted">{t("settings.loading")}</p> : null}
       {settings.isError ? <div className="inline-error" role="alert">{t("settings.loadFailed")}</div> : null}
       {!settings.isLoading && !settings.isError ? (
@@ -120,7 +145,7 @@ export function ServerSettingsPage() {
             <div className="field full"><label className="field-label" htmlFor="frpc-image">{t("settings.frpcImage")}<HelpTip label={t("settings.frpcImage")} text={t("settings.help.frpcImage")} /></label><div className="field-with-action"><input id="frpc-image" {...register("frpcImage")} spellCheck={false} aria-invalid={!!errors.frpcImage} /><button type="button" className="secondary-button" onClick={() => setValue("frpcImage", DEFAULT_FRPC_IMAGE, { shouldDirty: true, shouldValidate: true })}>{t("settings.restoreDefault")}</button></div></div>
           </div>
           <footer className="dialog-actions">
-            <button type="button" className="secondary-button" disabled={isDirty || !configured} onClick={() => setShowGuide(true)}>{t("settings.openGuide")}</button>
+            <button type="button" className="secondary-button" disabled={isDirty || !configured || tokenState === "missing"} onClick={() => setShowGuide(true)}>{t("settings.openGuide")}</button>
             {save.isSuccess ? <span className="save-success" role="status">{t("settings.saved")}</span> : null}
             {save.isError ? <span className="field-error" role="alert">{t("settings.saveFailed")}</span> : null}
             <button type="submit" className="primary-button" disabled={save.isPending}>{t(save.isPending ? "settings.saving" : "settings.save")}</button>
@@ -134,10 +159,10 @@ export function ServerSettingsPage() {
           {frpcStatus.data?.image ? <code className="service-image">{frpcStatus.data.image}</code> : null}
           {isDirty ? <p className="field-error">{t("settings.service.saveFirst")}</p> : null}
           <div className="service-actions">
-            <button type="button" className="primary-button" disabled={actionsDisabled} onClick={() => serviceAction.mutate("start")}>{t("common.start")}</button>
-            <button type="button" className="secondary-button" disabled={actionsDisabled || frpcStatus.data?.state !== "running"} onClick={() => serviceAction.mutate("restart")}>{t("common.restart")}</button>
+            <button type="button" className="primary-button" disabled={actionsDisabled || !tokenReady} onClick={() => serviceAction.mutate("start")}>{t("common.start")}</button>
+            <button type="button" className="secondary-button" disabled={actionsDisabled || !tokenReady || frpcStatus.data?.state !== "running"} onClick={() => serviceAction.mutate("restart")}>{t("common.restart")}</button>
             <button type="button" className="secondary-button" disabled={actionsDisabled || frpcStatus.data?.state !== "running"} onClick={() => serviceAction.mutate("stop")}>{t("common.stop")}</button>
-            <button type="button" className="secondary-button" disabled={actionsDisabled} onClick={() => connectivity.mutate()}>{t(connectivity.isPending ? "settings.service.testing" : "settings.service.test")}</button>
+            <button type="button" className="secondary-button" disabled={actionsDisabled || !tokenAvailable} onClick={() => connectivity.mutate()}>{t(connectivity.isPending ? "settings.service.testing" : "settings.service.test")}</button>
           </div>
           {serviceAction.isError ? <div className="inline-error" role="alert">{t("settings.service.actionFailed")}</div> : null}
           {connectivity.data ? <p className={connectivity.data.success ? "save-success" : "field-error"} role="status">{t(`settings.service.testResults.${connectivity.data.code}`)}</p> : null}

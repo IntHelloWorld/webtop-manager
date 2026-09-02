@@ -1,13 +1,15 @@
 # Security policy
 
+[简体中文](SECURITY.zh-CN.md)
+
 Webtop Manager controls a local Docker daemon and must be treated as
 security-sensitive software. Please do not disclose a vulnerability, token,
 password, private template, host path, or diagnostic archive in a public issue.
 
 ## Supported versions
 
-The project is currently an alpha preview. Security fixes are provided only for
-the latest GitHub pre-release. Older builds and source snapshots are unsupported.
+Security fixes are provided for the latest `1.x` GitHub release. Older minor
+releases, pre-release builds, and unversioned source snapshots are unsupported.
 
 ## Reporting a vulnerability
 

@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential curl file libayatana-appindicator3-dev \
-            librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev patchelf zstd
+            jq librsvg2-dev libssl-dev libwebkit2gtk-4.1-dev openssl patchelf sqlite3 zstd
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Verify release metadata
@@ -57,6 +57,10 @@ jobs:
         run: ./scripts/package-controller.sh
       - name: Verify bundled controller archive
         run: zstd --test --quiet src-tauri/assets/controller-image.tar.zst
+      - name: Probe bundled controller image
+        run: ./scripts/test-packaged-controller.sh
+      - name: Run Docker-backed release acceptance
+        run: ./scripts/test-docker-acceptance.sh
       - name: Build Linux packages
         run: pnpm tauri build --bundles deb,appimage
       - name: Stage release assets and checksums
@@ -90,11 +94,11 @@ jobs:
         with:
           name: webtop-manager-linux-x86_64
           path: release-assets
-      - name: Publish pre-release
+      - name: Publish GitHub release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release-assets/*
           fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: true
-          make_latest: false
+          prerelease: false
+          make_latest: true

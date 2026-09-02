@@ -1,52 +1,75 @@
-# v1 implementation status
+# Version 1.0 implementation status
 
-This repository is an executable first milestone, not a claim that the full
-product acceptance suite is complete.
+[简体中文](v1-status.zh-CN.md)
 
-## Implemented
+Version 1.0 satisfies the release acceptance scope defined for this repository.
+The product boundary remains intentionally narrow: Linux x86_64, a local Docker
+Engine, and newly created Webtop Manager environments only.
+
+## Accepted for 1.0
 
 - Independent Tauri 2 + React/TypeScript/Vite + Rust workspace.
-- Docker-missing, permission, daemon and world-writable Socket diagnostics.
-- Bundled controller-image build/load path and hardened persistent container configuration.
-- `0600` Unix Socket `/v1` API and SQLite WAL state.
-- Typed environment creation/start/stop/restart/delete commands.
-- Reserved-field checks, non-privileged policy, app-label ownership and canonical delete containment.
-- Password file injection without putting the password in Docker environment values.
-- Snapshot worker preflight, special-file report, `tar.zst`, SHA-256 and atomic publication.
-- Simplified Chinese and English shell, create flow, high-risk warnings and delete confirmation.
-- Official LinuxServer Webtop image inventory, local-image detection, allowlisted Docker pulls,
-  live layer progress/output and request cancellation.
-- Persistent FRP server settings with the authentication token isolated in a `0600` file.
-- Automatically generated FRP tokens, a copyable remote frps Docker setup guide,
-  shared frpc start/restart/stop/status controls and authenticated connectivity tests.
-- Explicit per-environment FRP publish/unpublish controls with automatic
-  remote-port allocation, generated public links, copy support and frpc proxy
-  refresh on lifecycle changes.
-- Host-correct `/config` bind paths plus allowlisted opening of managed data directories.
-- `.deb`/AppImage CI with checksums.
-- frpc v0.70.1 amd64 manifest pinned as
-  `sha256:e6483f2a916de67281597ba8fd03dc25d4f6fbd7ed0eafa042b2a5e4dcb5ee22`.
-- Independent multi-layer templates created from stopped managed environments,
-  with conservative preflight, a complete `/config` snapshot, metadata
-  verification, lineage, source digest checks, missing-image detection and
+- Docker-missing, permission, daemon, and world-writable Socket diagnostics.
+- Bundled controller-image build/load path and hardened persistent container.
+- Mode-`0600` Unix Socket `/v1` API, versioned SQLite schema, and WAL state.
+- Typed environment creation/start/stop/restart/delete operations.
+- Reserved-field checks, non-privileged policy, ownership labels, and canonical
+  deletion containment.
+- Password file injection without putting passwords in Docker environment
+  values, SQLite, logs, or frontend events.
+- Official LinuxServer Webtop inventory, local-image detection, allowlisted
+  pulls, live progress, explicit cancellation, controller-restart resumption,
+  and desktop reattachment.
+- Persistent FRP settings with the token isolated in a mode-`0600` file.
+- One-time generated FRP tokens, fingerprint-backed missing-token detection,
+  gated remote re-pairing, server setup guides, shared frpc lifecycle controls,
+  authenticated connectivity tests, and explicit per-environment publication.
+- Serialized remote-port allocation with detection and retry when an external
+  FRP client wins a concurrent allocation race.
+- Host-correct `/config` bind paths and allowlisted managed-directory opening.
+- Independent multi-layer templates with a complete `/config` snapshot,
+  conservative preflight, metadata and digest checks, lineage, and
   dependency-aware deletion.
-- Versioned `.wtmpl` save/load transfer containing exactly a Docker save archive
-  and `/config` snapshot, with strict static validation, hash/size checks,
-  staging-tag rewriting and native UUID-only open/save bridging.
-- SQLite-backed template operations with progress, typed results, UI task
-  recovery, controller-restart retryable state and partial-file cleanup.
+- Versioned `.wtmpl` export/import with fixed payloads, offline Docker load,
+  traversal protection, hash/size validation, and UUID-only native staging.
+- Persistent template operations with bounded redacted output, cooperative
+  cancellation, restart-safe terminal state, and partial-artifact cleanup.
+- Controller upgrades that import before interruption, back up protected state,
+  reject newer schemas, run a candidate against migrated state, verify health,
+  atomically switch container names, and restore the previous state/controller
+  on failure.
+- Docker-backed release acceptance for offline template round-trips, concurrent
+  FRP port conflicts, local and public HTTPS/TLS, and secret-leak checks across
+  Docker Inspect, API responses, SQLite, manifests, and controller logs.
+- Linux x86_64 `.deb` and AppImage release packages with SHA-256 checksums.
+- Complete Simplified Chinese and English desktop UI, README, and project documentation.
 
-## Required before full v1 acceptance
+## Explicitly outside the 1.0 scope
 
-- General-purpose cancellation and worker reattachment for non-template jobs.
-- Safe-rebuild transaction with health verification and rollback.
-- port-conflict retry after a concurrent external allocation race.
-- Additional image lifecycle operations beyond the allowlisted official and
-  app-owned template surfaces.
-- Configurable XDG environment/snapshot roots.
-- Controller backup/migration/rollback upgrade sequence.
-- Full Docker offline template round-trip, frps/TLS, and secret-leak acceptance
-  suites in CI (unit and UI coverage is present; daemon integration remains host-only).
+The following are product non-goals for 1.0 and do not block release:
 
-These gaps are kept explicit so a development build cannot be mistaken for a
-security-complete release.
+- Safe rebuild transactions for changing immutable environment configuration.
+- General-purpose image lifecycle operations beyond the allowlisted official
+  catalog and application-owned template surfaces.
+- User-configurable XDG environment and snapshot roots.
+
+Existing Compose projects and containers also remain outside the ownership
+boundary: Webtop Manager never imports, adopts, rebuilds, or deletes them.
+
+## Release gates
+
+Every 1.0 release must pass:
+
+```bash
+./scripts/check.sh
+cargo check --package webtop-manager --locked
+./scripts/check-release-version.sh v1.0.0
+./scripts/package-controller.sh
+zstd --test --quiet src-tauri/assets/controller-image.tar.zst
+./scripts/test-packaged-controller.sh
+./scripts/test-docker-acceptance.sh
+```
+
+The Docker-backed suite runs on `main`, by manual CI dispatch, and during the
+release workflow before package creation. It uses isolated state, sockets, FRP
+containers, and application-owned test resources.

@@ -42,6 +42,8 @@ async fn main() -> Result<()> {
         "WEBTOP_MANAGER_SOCKET",
         "/run/webtop-manager/controller.sock",
     )?;
+    let frpc_container_name =
+        managed_container_name("WEBTOP_MANAGER_FRPC_CONTAINER_NAME", "webtop-manager-frpc")?;
 
     tokio::fs::create_dir_all(&state_dir).await?;
     let secret_dir = state_dir.join("secrets");
@@ -58,9 +60,12 @@ async fn main() -> Result<()> {
     }
 
     let database = Database::open(&state_dir.join("controller.sqlite3")).await?;
-    let recovered = database.recover_unfinished_operations().await?;
-    if recovered > 0 {
-        tracing::warn!(recovered, "marked interrupted operations retryable");
+    let resumable = database.recover_unfinished_operations().await?;
+    if !resumable.is_empty() {
+        tracing::warn!(
+            resumable = resumable.len(),
+            "found interrupted durable operations to reattach"
+        );
     }
     cleanup_partial_files(&snapshot_root).await?;
     cleanup_partial_files(&staging_root).await?;
@@ -76,10 +81,14 @@ async fn main() -> Result<()> {
         snapshot_root,
         staging_root,
         server_token_path: secret_dir.join("frp-token"),
+        frpc_container_name,
         pull_cancellations: Arc::new(Mutex::new(HashMap::new())),
         operation_cancellations: Arc::new(Mutex::new(HashMap::new())),
         active_resources: Arc::new(Mutex::new(HashSet::new())),
+        publication_lock: Arc::new(Mutex::new(())),
+        token_lock: Arc::new(Mutex::new(())),
     };
+    api::resume_interrupted_operations(&state, resumable).await;
     reconcile_runtime_state(&state).await;
     info!(socket = %socket_path.display(), "controller ready");
     axum::serve(listener, router(state)).await?;
@@ -107,4 +116,17 @@ fn required_absolute_path(variable: &str, fallback: &str) -> Result<PathBuf> {
     let path = PathBuf::from(env::var_os(variable).unwrap_or_else(|| fallback.into()));
     anyhow::ensure!(path.is_absolute(), "{variable} must be absolute");
     Ok(path)
+}
+
+fn managed_container_name(variable: &str, fallback: &str) -> Result<String> {
+    let name = env::var(variable).unwrap_or_else(|_| fallback.into());
+    anyhow::ensure!(
+        name.starts_with("webtop-manager-")
+            && name.len() <= 128
+            && name.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            }),
+        "{variable} must be a Webtop Manager scoped Docker name"
+    );
+    Ok(name)
 }

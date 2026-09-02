@@ -7,6 +7,7 @@ import { Diagnostics } from "./features/diagnostics/Diagnostics";
 import { EnvironmentList } from "./features/environments/EnvironmentList";
 import { ImageCatalog } from "./features/images/ImageCatalog";
 import { ServerSettingsPage } from "./features/settings/ServerSettingsPage";
+import { GuidePage } from "./features/guide/GuidePage";
 import { OperationFeedbackProvider, useOperationFeedback } from "./components/OperationFeedbackContext";
 import { initializeBackend } from "./lib/api";
 import type { ApiError } from "./lib/types";
@@ -38,6 +39,7 @@ function AppContent() {
   return (
     <AppShell section={section} onSectionChange={setSection} activeOperation={activeOperation}>
       {section === "environments" ? <EnvironmentList hostUid={backend.data.hostUid} hostGid={backend.data.hostGid} /> : null}
+      {section === "guide" ? <GuidePage onNavigate={setSection} /> : null}
       {section === "images" ? <ImageCatalog /> : null}
       {section === "settings" ? <ServerSettingsPage /> : null}
       {section === "templates" ? <Suspense fallback={<p className="muted">{t("common.loading")}</p>}><TemplatesPage /></Suspense> : null}

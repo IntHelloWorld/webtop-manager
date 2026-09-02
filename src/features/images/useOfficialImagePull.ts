@@ -1,9 +1,11 @@
-import { useSyncExternalStore } from "react";
-import { cancelOfficialImagePull, pullOfficialImage } from "../../lib/api";
+import { useEffect, useRef, useSyncExternalStore } from "react";
+import { useOperationFeedback } from "../../components/OperationFeedbackContext";
+import { cancelOfficialImagePull, getOperation, pullOfficialImage } from "../../lib/api";
 import type { ImagePullProgress } from "../../lib/types";
 
 const MAX_LOG_LINES = 80;
 const PROGRESS_UPDATE_INTERVAL_MS = 100;
+const ACTIVE_PULL_STORAGE_KEY = "webtop-manager.image-pull.v1";
 
 interface ImagePullStoreState {
   reference: string | null;
@@ -37,6 +39,7 @@ let activePull: Promise<void> | null = null;
 let bufferedLogs: ImagePullProgress[] = [];
 let pendingProgress: ImagePullProgress | null = null;
 let progressTimer: number | null = null;
+let resumeStarted = false;
 const listeners = new Set<() => void>();
 
 function emit(next: Partial<ImagePullStoreState>) {
@@ -95,6 +98,7 @@ function start(reference: string) {
     isError: false,
     outcome: null,
   });
+  localStorage.setItem(ACTIVE_PULL_STORAGE_KEY, JSON.stringify({ pullId, reference }));
 
   activePull = pullOfficialImage(reference, pullId, appendProgress)
     .then((result) => {
@@ -105,13 +109,92 @@ function start(reference: string) {
         outcome: result.cancelled ? "cancelled" : "completed",
       });
     })
-    .catch(() => {
+    .catch(async () => {
+      const outcome = await followDurablePull(pullId, reference);
       flushProgress();
-      emit({ isPending: false, isCancelling: false, isError: true, outcome: null });
+      if (outcome === "completed" || outcome === "cancelled") {
+        emit({ isPending: false, isCancelling: false, isError: false, outcome });
+      } else {
+        emit({ isPending: false, isCancelling: false, isError: true, outcome: null });
+      }
     })
     .finally(() => {
+      localStorage.removeItem(ACTIVE_PULL_STORAGE_KEY);
       activePull = null;
     });
+}
+
+async function followDurablePull(
+  pullId: string,
+  reference: string,
+): Promise<"completed" | "cancelled" | "error"> {
+  let unavailableAttempts = 0;
+  while (unavailableAttempts < 240) {
+    try {
+      const operation = await getOperation(pullId);
+      unavailableAttempts = 0;
+      appendProgress({
+        pullId,
+        reference,
+        phase: "progress",
+        layerId: null,
+        status: "Image pull is running in the persistent controller",
+        currentBytes: operation.progressPercent,
+        totalBytes: 100,
+        aggregateCurrentBytes: operation.progressPercent,
+        aggregateTotalBytes: 100,
+      });
+      if (operation.phase === "succeeded") return "completed";
+      if (operation.phase === "cancelled") return "cancelled";
+      if (operation.phase === "failed" || operation.phase === "retryable") return "error";
+    } catch (error) {
+      if (
+        error
+        && typeof error === "object"
+        && "code" in error
+        && error.code === "INVALID_REQUEST"
+      ) return "error";
+      unavailableAttempts += 1;
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
+  }
+  return "error";
+}
+
+function resumeStoredPull() {
+  if (resumeStarted || activePull) return;
+  resumeStarted = true;
+  try {
+    const stored = JSON.parse(localStorage.getItem(ACTIVE_PULL_STORAGE_KEY) ?? "null") as unknown;
+    if (!stored || typeof stored !== "object") return;
+    const { pullId, reference } = stored as { pullId?: unknown; reference?: unknown };
+    if (typeof pullId !== "string" || typeof reference !== "string") return;
+    emit({
+      reference,
+      pullId,
+      latest: null,
+      logs: [],
+      isPending: true,
+      isCancelling: false,
+      isError: false,
+      outcome: null,
+    });
+    activePull = followDurablePull(pullId, reference)
+      .then((outcome) => {
+        flushProgress();
+        if (outcome === "completed" || outcome === "cancelled") {
+          emit({ isPending: false, isCancelling: false, isError: false, outcome });
+        } else {
+          emit({ isPending: false, isCancelling: false, isError: true, outcome: null });
+        }
+      })
+      .finally(() => {
+        localStorage.removeItem(ACTIVE_PULL_STORAGE_KEY);
+        activePull = null;
+      });
+  } catch {
+    localStorage.removeItem(ACTIVE_PULL_STORAGE_KEY);
+  }
 }
 
 async function cancel() {
@@ -125,6 +208,17 @@ async function cancel() {
 }
 
 export function useOfficialImagePull(): OfficialImagePullController {
+  const { activeOperation, beginOperation, finishOperation } = useOperationFeedback();
+  const feedbackId = useRef<string | null>(null);
+  useEffect(resumeStoredPull, []);
   const state = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  useEffect(() => {
+    if (state.isPending && state.reference && !feedbackId.current && !activeOperation) {
+      feedbackId.current = beginOperation("imagePull", state.reference, () => void cancel());
+    } else if (!state.isPending && feedbackId.current) {
+      finishOperation(feedbackId.current);
+      feedbackId.current = null;
+    }
+  }, [activeOperation, beginOperation, finishOperation, state.isPending, state.reference]);
   return { ...state, start, cancel };
 }

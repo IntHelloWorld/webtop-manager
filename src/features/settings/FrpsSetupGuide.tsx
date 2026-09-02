@@ -115,8 +115,8 @@ export function FrpsSetupGuide({ onClose }: FrpsSetupGuideProps) {
       <div className="security-banner warning-banner">
         <span aria-hidden="true">!</span>
         <div>
-          <strong>{t("settings.guide.secretTitle")}</strong>
-          <p>{t("settings.guide.secretHint")}</p>
+          <strong>{t(settings.data?.tokenState === "recovery_pending" ? "settings.recovery.guideTitle" : "settings.guide.secretTitle")}</strong>
+          <p>{t(settings.data?.tokenState === "recovery_pending" ? "settings.recovery.guideHint" : "settings.guide.secretHint")}</p>
         </div>
       </div>
 
@@ -234,7 +234,7 @@ export function FrpsSetupGuide({ onClose }: FrpsSetupGuideProps) {
                       bind: guide.bindPort,
                     })}
                   </li>
-                  <li>{t("settings.guide.stepReturn")}</li>
+                  <li>{t(settings.data.tokenState === "recovery_pending" ? "settings.recovery.stepReturn" : "settings.guide.stepReturn")}</li>
                 </ol>
                 <div className="code-header">
                   <strong>{t(`settings.guide.${scenario}.command`)}</strong>

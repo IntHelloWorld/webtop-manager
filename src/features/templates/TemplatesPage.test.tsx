@@ -48,7 +48,7 @@ afterEach(() => cleanup());
 beforeEach(() => {
   localStorage.clear();
   Object.values(api).forEach((mock) => mock.mockReset());
-  api.getServerSettings.mockResolvedValue({ frpsHost: "", publicIp: "", frpsPort: 7000, remotePortStart: 41000, remotePortEnd: 42000, tokenConfigured: true, frpcImage: "frpc" });
+  api.getServerSettings.mockResolvedValue({ frpsHost: "", publicIp: "", frpsPort: 7000, remotePortStart: 41000, remotePortEnd: 42000, tokenConfigured: true, tokenState: "ready", frpcImage: "frpc" });
   api.listTemplates.mockResolvedValue([{
     id: "11111111-1111-4111-8111-111111111111", name: "工作模板", imageReference: "com.cue.webtop-manager/template:11111111-1111-4111-8111-111111111111", imageId: "sha256:image", platform: "linux/amd64",
     systemSizeBytes: 1000, systemDeltaBytes: 500, snapshotPath: "opaque/config.tar.zst", snapshotSha256: "a".repeat(64), snapshotSizeBytes: 700, snapshotOriginalBytes: 900,

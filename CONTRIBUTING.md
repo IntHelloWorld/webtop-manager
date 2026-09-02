@@ -1,5 +1,7 @@
 # Contributing
 
+[简体中文](CONTRIBUTING.zh-CN.md)
+
 Webtop Manager is an alpha-stage, security-sensitive desktop application. Small,
 focused changes with tests and an explicit security rationale are easiest to
 review.

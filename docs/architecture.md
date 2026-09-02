@@ -1,5 +1,7 @@
 # Architecture
 
+[简体中文](architecture.zh-CN.md)
+
 ## Process boundary
 
 ```text
@@ -66,7 +68,9 @@ Implemented routes in the first code milestone:
 - `DELETE /v1/environments/{id}` with exact-name confirmation
 - `GET /v1/images/official` and allowlisted `POST /v1/images/pull`
 - `GET|PUT /v1/settings/server` with the FRP token stored outside SQLite
-- `POST /v1/settings/server/token/regenerate` for app-managed token rotation
+- `POST /v1/settings/server/token/recover`, accepted only when the protected
+  local token is missing or invalid; SQLite stores only its SHA-256 fingerprint
+  and recovery state
 - `GET /v1/frpc` and fixed `start|restart|stop|test` frpc operations
 - `GET /v1/frps/setup` for an explicitly requested, secret-bearing setup command
 - `GET|POST /v1/templates`, template preflight, restore, source-check, export and

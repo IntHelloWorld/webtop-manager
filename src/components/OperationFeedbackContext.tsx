@@ -8,6 +8,7 @@ export type OperationKind =
   | "environmentRestart"
   | "publish"
   | "unpublish"
+  | "imagePull"
   | "imageDelete"
   | "cachePrune";
 
@@ -15,11 +16,12 @@ export interface ActiveOperation {
   id: string;
   kind: OperationKind;
   target: string;
+  cancel?: () => void;
 }
 
 interface OperationFeedbackValue {
   activeOperation: ActiveOperation | null;
-  beginOperation: (kind: OperationKind, target: string) => string | null;
+  beginOperation: (kind: OperationKind, target: string, cancel?: () => void) => string | null;
   finishOperation: (id: string) => void;
 }
 
@@ -30,10 +32,10 @@ export function OperationFeedbackProvider({ children }: { children: ReactNode })
   const activeRef = useRef<ActiveOperation | null>(null);
   const sequence = useRef(0);
 
-  const beginOperation = useCallback((kind: OperationKind, target: string) => {
+  const beginOperation = useCallback((kind: OperationKind, target: string, cancel?: () => void) => {
     if (activeRef.current) return null;
     sequence.current += 1;
-    const operation = { id: `${Date.now()}-${sequence.current}`, kind, target };
+    const operation = { id: `${Date.now()}-${sequence.current}`, kind, target, cancel };
     activeRef.current = operation;
     setActiveOperation(operation);
     return operation.id;

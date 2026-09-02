@@ -9,6 +9,8 @@ source_environment_id=""
 derived_environment_id=""
 template_id=""
 imported_template_id=""
+source_image_id=""
+source_repo_digest=""
 test_image=${WEBTOP_TEMPLATE_TEST_IMAGE:-lscr.io/linuxserver/webtop:latest}
 
 api() {
@@ -19,6 +21,18 @@ api() {
     curl --connect-timeout 3 --max-time 120 --fail --silent --show-error --unix-socket "$socket_path" -X "$method" -H 'content-type: application/json' --data "$body" "http://localhost$path"
   else
     curl --connect-timeout 3 --max-time 120 --fail --silent --show-error --unix-socket "$socket_path" -X "$method" "http://localhost$path"
+  fi
+}
+
+restore_source_image() {
+  if docker image inspect "$test_image" >/dev/null 2>&1; then
+    return
+  fi
+  if [[ -n "$source_repo_digest" ]]; then
+    docker pull "$source_repo_digest" >/dev/null
+    docker image tag "$source_repo_digest" "$test_image"
+  elif [[ -f "$test_root/source-image.tar" ]]; then
+    docker load --input "$test_root/source-image.tar" >/dev/null
   fi
 }
 
@@ -58,6 +72,10 @@ cleanup() {
     docker image rm "com.cue.webtop-manager/template:$id" >/dev/null 2>&1
     docker image rm "com.cue.webtop-manager/import-staging:$id" >/dev/null 2>&1
   done
+  if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 ]] \
+    && ! docker image inspect "$test_image" >/dev/null 2>&1; then
+    restore_source_image >/dev/null 2>&1 || true
+  fi
   if [[ $exit_status -ne 0 && -f "$test_root/controller.log" ]]; then
     echo "integration controller log:" >&2
     tail -80 "$test_root/controller.log" >&2
@@ -73,6 +91,11 @@ trap cleanup EXIT
 
 command -v jq >/dev/null
 docker image inspect "$test_image" >/dev/null
+source_image_id=$(docker image inspect "$test_image" --format '{{.Id}}')
+source_repo_digest=$(docker image inspect "$test_image" --format '{{json .RepoDigests}}' | jq -r '.[0] // empty')
+if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 && -z "$source_repo_digest" ]]; then
+  docker save --output "$test_root/source-image.tar" "$test_image"
+fi
 cargo build --workspace >/dev/null
 
 mkdir -p "$test_root/state" "$test_root/environments" "$test_root/snapshots" "$test_root/staging"
@@ -113,11 +136,6 @@ template_id=$(jq -r .resourceId <<<"$create_operation")
 create_result=$(wait_operation "$(jq -r .id <<<"$create_operation")")
 jq -e '.logLines | any(contains("snapshot complete")) and any(contains("commit complete"))' <<<"$create_result" >/dev/null
 
-if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 ]]; then
-  echo "integration: remove source image tag"
-  docker image rm "$test_image" >/dev/null
-fi
-
 template=$(api GET /v1/templates | jq -c --arg id "$template_id" '.[] | select(.id == $id)')
 jq -e '.integrity == "complete" and .platform == "linux/amd64" and .snapshotSizeBytes > 0' <<<"$template" >/dev/null
 docker image inspect "com.cue.webtop-manager/template:$template_id" --format '{{json .Config.Entrypoint}} {{json .Config.Volumes}}' | grep -q '/init.*config'
@@ -128,13 +146,34 @@ export_result=$(wait_operation "$(jq -r .id <<<"$export_operation")")
 jq -e '.logLines | any(contains("image stream complete")) and any(contains("export staged"))' <<<"$export_result" >/dev/null
 staging_id=$(jq -r .result.stagingFileId <<<"$export_result")
 test -s "$test_root/staging/$staging_id.wtmpl"
+password=$(<"$test_root/environments/$source_environment_id/secrets/password")
+manifest=$(tar -xOf "$test_root/staging/$staging_id.wtmpl" manifest.json)
+source_container=$(docker container ls -aq \
+  --filter "label=com.cue.webtop-manager.resource-id=$source_environment_id" | head -1)
+[[ -n "$source_container" ]]
+inspect_output=$(docker inspect "$source_container")
+api_output="$(api GET /v1/environments)$(api GET /v1/templates)$(api GET "/v1/operations/$(jq -r .id <<<"$export_operation")")"
+database_strings=$(strings "$test_root/state/controller.sqlite3")
+controller_log=$(<"$test_root/controller.log")
+for output in "$manifest" "$inspect_output" "$api_output" "$database_strings" "$controller_log"; do
+  [[ "$output" != *"$password"* ]]
+done
 
 echo "integration: delete local template image and import package"
 api DELETE "/v1/environments/$source_environment_id" '{"confirmationName":"integration-source","deleteData":true}' >/dev/null
 source_environment_id=""
+if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 ]]; then
+  echo "integration: remove source image tag before offline import"
+  docker image rm "$test_image" >/dev/null
+fi
 delete_operation=$(api DELETE "/v1/templates/$template_id" '{"confirmationName":"integration-template"}')
 wait_operation "$(jq -r .id <<<"$delete_operation")" >/dev/null
 docker image inspect "com.cue.webtop-manager/template:$template_id" >/dev/null 2>&1 && exit 1
+if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 ]]; then
+  docker image rm "$source_image_id" >/dev/null 2>&1 || true
+  ! docker image inspect "$test_image" >/dev/null 2>&1
+  ! docker image inspect "$source_image_id" >/dev/null 2>&1
+fi
 
 import_preflight=$(api POST /v1/template-imports/preflight "{\"stagingFileId\":\"$staging_id\"}")
 jq -e '.manifest.platform == "linux/amd64" and .untrustedImageWarning' <<<"$import_preflight" >/dev/null
@@ -149,9 +188,13 @@ restore_operation=$(api POST "/v1/templates/$imported_template_id/environments" 
 restore_result=$(wait_operation "$(jq -r .id <<<"$restore_operation")")
 derived_environment_id=$(jq -r .result.environmentId <<<"$restore_result")
 grep -qx 'portable-config-round-trip' "$test_root/environments/$derived_environment_id/config/integration-proof.txt"
+[[ "$(docker inspect "com.cue.webtop-manager/template:$imported_template_id" --format '{{.Os}}/{{.Architecture}}')" == "linux/amd64" ]]
 
 api DELETE "/v1/environments/$derived_environment_id" '{"confirmationName":"integration-restored","deleteData":true}' >/dev/null
 derived_environment_id=""
+if [[ ${WEBTOP_TEMPLATE_REMOVE_SOURCE_IMAGE:-0} == 1 ]]; then
+  restore_source_image
+fi
 delete_imported=$(api DELETE "/v1/templates/$imported_template_id" '{"confirmationName":"integration-imported"}')
 wait_operation "$(jq -r .id <<<"$delete_imported")" >/dev/null
 imported_template_id=""
