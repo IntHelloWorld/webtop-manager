@@ -973,13 +973,11 @@ async fn export_job(
             params: BTreeMap::new(),
         });
     }
-    let image = state
-        .docker
-        .inspect_image(&template.image_reference)
-        .await
-        .map_err(docker_error)?;
+    let image_for_config_hash = image_payload.clone();
     let image_config_sha256 =
-        json_sha256(&serde_json::to_value(&image.config).map_err(internal_error)?)
+        tokio::task::spawn_blocking(move || saved_image_config_sha256(&image_for_config_hash))
+            .await
+            .map_err(internal_error)?
             .map_err(internal_error)?;
     let mut lineage = template.external_lineage.clone();
     if let Some(parent) = template.parent_template_id {
@@ -2406,6 +2404,14 @@ fn read_saved_manifest_and_config(path: &FsPath) -> Result<(serde_json::Value, s
     bail!("Docker image config is missing")
 }
 
+fn saved_image_config_sha256(path: &FsPath) -> Result<String> {
+    let (_, config) = read_saved_manifest_and_config(path)?;
+    let config_summary = config
+        .get("config")
+        .context("Docker image config summary missing")?;
+    json_sha256(config_summary)
+}
+
 fn sanitize_imported_image_config(config: &mut serde_json::Value, new_ref: &str) -> Result<()> {
     let local_id = new_ref
         .rsplit_once(':')
@@ -2796,6 +2802,11 @@ mod tests {
             .unwrap();
             archive.into_inner().unwrap().finish().unwrap();
         }
+
+        assert_eq!(
+            saved_image_config_sha256(&source).unwrap(),
+            json_sha256(&config["config"]).unwrap()
+        );
 
         rewrite_image_archive(source, destination.clone(), &old_ref, &new_ref)
             .await
