@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1.7
-FROM --platform=$BUILDPLATFORM rust:1.88.0-alpine@sha256:9dfaae478ecd298b6b5a039e1f2cc4fc040fc818a2de9aa78fa714dea036574d AS builder
+FROM --platform=$BUILDPLATFORM rust:1.99.0-alpine@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627 AS builder
 RUN apk add --no-cache musl-dev pkgconfig
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rustfmt.toml ./
